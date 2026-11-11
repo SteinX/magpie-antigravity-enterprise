@@ -1,0 +1,12 @@
+node_modules/
+.DS_Store
+*.log
+coverage/
+.env
+.env.*
+keychain-helper-*
+principal-*
+refresh.lock
+plugin-auth.json
+logins.json
+providers.json
