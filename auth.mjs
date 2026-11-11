@@ -5,6 +5,8 @@ import { mkdir, readFile, rename, stat, writeFile, unlink } from 'node:fs/promis
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { CliMetadataError, readCliMetadata } from './cli-metadata.mjs';
+import { nativeFetch } from './transport.mjs';
 
 const APP = '/Applications/Antigravity.app';
 const PREFIX = 'go-keyring-base64:';
@@ -15,7 +17,6 @@ const WIF_CLIENT = 'a2a6f0e3e-3ff0-462b-869a-47277df4c806';
 // Source: Mag1cFall/Antigravity2API, 6aa1a0a, internal/antigravity/oauth.go.
 const CLOUD_SECRET_HASH = 'a2ddedc84850a9c48b7e01d61700848083bf0e10fb8d6c99c496803e8b48ced0';
 const flights = new Map();
-const metadataCache = new Map();
 const clientCache = new Map();
 const helperBuilds = new Map();
 
@@ -34,7 +35,7 @@ const checkAbort = signal => { if (signal?.aborted) throw aborted(); };
 const tokenSnapshot = profile => hash(JSON.stringify(profile.token));
 const providerKey = profile => JSON.stringify([profile.auth_method, profile.wif_provider]);
 const tokenKey = profile => hash(JSON.stringify([profile.auth_method, profile.wif_provider, profile.token.refresh_token]));
-const publicError = error => error instanceof NativeAuthError || error?.name === 'AbortError'
+const publicError = error => error instanceof NativeAuthError || error instanceof CliMetadataError || error?.name === 'AbortError'
   ? (error?.name === 'AbortError' ? aborted() : error)
   : failure('ERR_NATIVE_AUTH', 'Native authentication failed; no credential details were recorded.');
 
@@ -112,30 +113,6 @@ function binding(profile) {
     throw failure('ERR_NATIVE_PRINCIPAL', 'The native account has no verified principal binding.');
   }
   return hash(JSON.stringify([profile._principal, profile.auth_method, profile.wif_provider]));
-}
-
-async function installedMetadata(appPath) {
-  const executable = join(appPath, 'Contents/Resources/bin/language_server');
-  const plist = join(appPath, 'Contents/Info.plist');
-  const [binaryStat, plistStat] = await Promise.all([stat(executable), stat(plist)]);
-  const key = `${executable}:${binaryStat.mtimeMs}:${binaryStat.size}:${plistStat.mtimeMs}`;
-  let pending = metadataCache.get(key);
-  if (!pending) {
-    pending = Promise.all([
-      run(executable, ['--stamp']),
-      run('/usr/bin/plutil', ['-extract', 'CFBundleShortVersionString', 'raw', '-o', '-', plist]),
-    ]).then(([stamp, versionText]) => {
-      const version = versionText.trim();
-      const cl = /^Built at CL:\s*(\d+)\s*$/m.exec(stamp)?.[1];
-      if (!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version) || !cl) {
-        throw failure('ERR_NATIVE_VERSION', 'The installed Antigravity version or build could not be identified.');
-      }
-      return { executable, version, cl, platform: process.platform, arch: process.arch };
-    });
-    metadataCache.set(key, pending);
-    pending.catch(() => metadataCache.delete(key));
-  }
-  return pending;
 }
 
 async function installedClientConfig(appPath, profile) {
@@ -301,10 +278,10 @@ export function createNativeSession(options = {}) {
   const overrides = options._deps ?? {};
   const deps = {
     now: Date.now,
-    fetch: globalThis.fetch,
+    fetch: nativeFetch,
     readCredential: ({ signal } = {}) => run('/usr/bin/security', ['find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w'], { signal }),
     withRefreshLock: (task, signal) => withNativeLock(stateDir, task, signal),
-    metadata: () => installedMetadata(appPath),
+    metadata: () => readCliMetadata(options.cliPath),
     oauthConfig: profile => installedClientConfig(appPath, profile),
     async readPrincipal(key) {
       try {
@@ -518,7 +495,7 @@ export function createNativeSession(options = {}) {
         if (!['gcp', 'wif', 'business_licensed_enterprise'].includes(profile?.auth_method)) {
           throw failure('ERR_NATIVE_METHOD', 'Cannot identify an unsupported native authentication method.');
         }
-        return `antigravity/${metadata.version} (aidev_client; os_type=${metadata.platform}; arch=${metadata.arch}; cl=${metadata.cl}; auth_method=${profile.auth_method})`;
+        return `antigravity/cli/${metadata.version} (aidev_client; os_type=${metadata.platform}; arch=${metadata.arch}; cl=${metadata.cl}; auth_method=${profile.auth_method})`;
       } catch (error) { throw publicError(error); }
     },
     binding,

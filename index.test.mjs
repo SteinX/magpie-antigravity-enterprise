@@ -28,13 +28,13 @@ async function fixture(t, responses = [sse()], { binding = "native-account" } = 
     binding: () => binding,
     identity: async () => "antigravity/native-test-client",
   }
-  t.mock.method(globalThis, "fetch", async (url, init) => {
+  const fetch = async (url, init) => {
     requests.push({ url, ...init, headers: new Headers(init.headers), payload: JSON.parse(init.body) })
     const response = responses[requests.length - 1]
     assert.ok(response, "An unexpected upstream request was made")
     return response
-  })
-  const plugin = await AntigravityEnterprisePlugin({}, { _deps: { createNativeSession: () => native } })
+  }
+  const plugin = await AntigravityEnterprisePlugin({}, { _deps: { createNativeSession: () => native, fetch } })
   const client = await plugin.auth.loader(async () => ({ type: "api", metadata }))
   return { fetch: client.fetch, requests, profiles, metadata, native }
 }

@@ -6,6 +6,7 @@ A local Magpie provider for the enterprise account already signed in to Antigrav
 
 - Magpie with provider-plugin support.
 - Antigravity App installed and signed in to a Google Cloud or Workforce Identity Federation enterprise account.
+- [Official agy CLI](https://antigravity.google/docs/getting-started.md?tab=cli), normally installed at `~/.local/bin/agy`. Set the package option `cliPath` for a custom installation.
 - macOS login Keychain access. The plugin uses Antigravity's existing `gemini / antigravity` item.
 - Xcode Command Line Tools (`xcrun swiftc`) for the first credential renewal. A small Security-framework helper is compiled once and cached; credentials are supplied through stdin, never compiler arguments or source files.
 
@@ -47,14 +48,15 @@ Renewed tokens are written to the original Keychain item while preserving its ot
 
 Binding uses an authenticated principal when available, otherwise a successfully renewed refresh-token lineage. Rotations made by this plugin retain that lineage. An unknown externally replaced or rotated token requires explicit rebinding rather than assuming it belongs to the same account. The plugin never selects another native identity merely because its project or provider matches.
 
-Nonsecret principal fingerprints, the compiled helper, and its lock are stored under `~/.config/magpie/antigravity-enterprise`. Package options `appPath` and `stateDir` may change the App path and state directory; all plugin hosts sharing the same native Keychain item must use the same `stateDir` to share its renewal lock.
+Nonsecret principal fingerprints, the compiled helper, and its lock are stored under `~/.config/magpie/antigravity-enterprise`. Package options `appPath`, `cliPath`, and `stateDir` may change the App, CLI executable, and state paths. All plugin hosts sharing the same native Keychain item must use the same `stateDir` to share its renewal lock.
 
 ## Request compatibility
 
-- Reads the installed App's version and native build number; sends matching platform, architecture, and authentication metadata.
+- Reads the installed CLI's version and runtime build from its thin Darwin Mach-O executable and sends `antigravity/cli/...` identity with the native authentication label. The observed build-stamp layout is validated against captured CLI traffic; missing, ambiguous, changed, or unsupported binaries fail explicitly. Metadata is cached by file identity and re-read after a CLI update. Installed App client configuration is still used for OAuth checks.
 - Discovers the selected account's enabled model IDs and capabilities instead of keeping a consumer-model fallback list.
 - Routes enterprise inference to the matching global, US, or EU `businessaicode` deployment.
 - Uses the flat enterprise Gemini payload, license entitlement, and trajectory/request ID headers.
+- Uses request-owned HTTP/2 connections for native API traffic, with verified TLS, proxy CONNECT, `NO_PROXY`, streaming gzip, cancellation, and response backpressure. Generation omits Content-Length; catalog and refresh POSTs declare their actual encoded byte length. The transport does not add Fetch's default Accept or HTTP/1 connection headers.
 - Numbers requests independently within each trajectory as `<trajectory-id>-<counter>`. Prior model-generation messages establish a history lower bound; tool-result-only messages do not consume generation numbers. Counters are scoped to the bound account, project, and location. Failed attempts are retained in memory; history cannot reconstruct unseen failures after eviction or restart.
 - Accepts standard Fetch `Request`, `URL`, and string inputs, including request-body overrides, headers, and cancellation.
 - Preserves `parametersJsonSchema`. Legacy `parameters` containing JSON Schema-only syntax use that field without dropping references, unions, or `additionalProperties`; native Google Schema stays in `parameters`.
@@ -71,7 +73,7 @@ npm test
 
 The deterministic suite covers effective authentication selection, renewal ownership and cancellation, token replacement races, rotation lineage, per-account configuration preservation, Fetch input semantics, regional routing, complex tool schemas, fragmented SSE, signatures, tool calls, upstream errors, and cancellation. Error-event fixtures exercise the generic Google RPC/SSE contract; they are not captured App responses. Live model checks consume the selected enterprise account's allowance.
 
-Validated with Magpie 0.1.3673, Antigravity App 2.31.0, and official CLI 1.5.5: all 124 deterministic checks passed. Integration exercised native renewal, Gemini SSE generation, signed tool-call/result continuation, complex JSON Schema, OpenAI Chat SSE/tools, and Responses translation. The installed daily gateway completed a complex-schema tool call and its result continuation. The same schema containing `$defs`, `$ref`, union types, and `additionalProperties` was rejected by the enterprise API in `parameters` with HTTP 400 and accepted unchanged in `parametersJsonSchema` with HTTP 200. US/EU routing has deterministic coverage; the live license used global.
+Validated with Magpie 0.1.3673 and its Bun 1.4.4 runtime, Antigravity App 2.31.0, and official CLI 1.5.5: all 198 deterministic checks passed. Integration exercised native renewal, Gemini SSE generation, signed tool-call/result continuation, complex JSON Schema, OpenAI Chat SSE/tools, and Responses translation. The installed daily gateway completed a complex-schema tool call and its result continuation. The same schema containing `$defs`, `$ref`, union types, and `additionalProperties` was rejected by the enterprise API in `parameters` with HTTP 400 and accepted unchanged in `parametersJsonSchema` with HTTP 200. US/EU routing has deterministic coverage; the live license used global.
 
 ### Decrypted CLI reference
 
@@ -84,10 +86,12 @@ The official arm64 CLI 1.5.5 artifact was verified against the release-manifest 
 | Request IDs | Trajectory UUID plus a counter; native tool requests used 0 and 1, then resumed at 2 in another CLI process | Per-trajectory numbering, with a lower bound from supplied history |
 | Tool continuation | Model-role function call and function response; real call ID and thought signature retained | Native-schema replay returned HTTP 200 twice; captured signature and call ID matched the follow-up request |
 | Agent context | CLI prompts, cascade labels, experiment/ACL calls, and telemetry | Caller prompts and labels are preserved; CLI agent activity is not synthesized |
-| Client identity | `antigravity/cli/1.5.5`, build 1017970541 | Installed App identity: `antigravity/2.31.0`, build 1017595969 in this validation |
-| HTTP transport | Go HTTP/2 | Bun HTTP/1.1, including its generated `Accept: */*`, connection, host, and content-length headers |
+| Client identity | `antigravity/cli/1.5.5`, build 1017970541 | Matched; version and build are read from the installed CLI, including after executable replacement |
+| HTTP transport | Go HTTP/2 | HTTP/2 in Magpie's Bun 1.4.4 runtime; generation header names and normalized values match, with no extra Accept, connection, host, or content-length headers |
 
-The capture covered a WIF-backed native profile whose stored authentication label was `gcp`. Non-WIF cloud OAuth, live regional licenses, all-model authorization, and TLS fingerprint equivalence remain unverified. Raw credential values were excluded before evidence was written; the detailed redacted capture remains local. These results establish the core licensed request/response protocol and explicitly retain the client-identity and transport differences above.
+The latest header capture compared the official CLI and the real provider under Magpie's bundled Bun runtime. Catalog discovery returned 31 models and generation returned HTTP 200 / `OK`; the generation User-Agent matched exactly. After normalizing dynamic bearer credentials and UUIDs, all six generation headers and their values matched. Tokens were separately checked against the current native credential. Header order, HTTP/2 SETTINGS/HPACK behavior, connection reuse, and TLS fingerprints are outside this equality check.
+
+The capture covered a WIF-backed native profile whose stored authentication label was `gcp`. Non-WIF cloud OAuth, live regional licenses, and all-model authorization remain unverified. Raw credential values were excluded before evidence was written; detailed redacted captures remain local.
 
 ## Protocol references
 

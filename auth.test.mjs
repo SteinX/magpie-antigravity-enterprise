@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inspect } from 'node:util';
 import { createNativeSession } from './auth.mjs';
+import { CliMetadataError } from './cli-metadata.mjs';
 
 const NOW = Date.parse('2026-11-11T12:00:00Z');
 const encode = value => 'go-keyring-base64:' + Buffer.from(JSON.stringify(value)).toString('base64');
@@ -33,7 +34,7 @@ function fixture(initial = native(), options = {}) {
   const calls = { reads: 0, commits: 0, oauthConfigs: 0, renewals: 0, userinfo: 0, urls: [], forms: [], headers: [], signals: [] };
   const deps = {
     now: () => NOW,
-    metadata: async () => ({ version: '2.31.0', cl: '1017595969', platform: 'darwin', arch: 'arm64' }),
+    metadata: async () => ({ version: '1.5.5', cl: '1017970541', platform: 'darwin', arch: 'arm64' }),
     readCredential: async ({ signal } = {}) => {
       calls.reads++;
       if (signal?.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
@@ -98,7 +99,7 @@ test('preserves native fields and keeps caller license selection separate', asyn
   assert.equal(result.writer_id, 'native-writer');
   assert.deepEqual(config, original);
   assert.equal(f.calls.renewals, 0);
-  assert.equal(await f.session.identity(result), 'antigravity/2.31.0 (aidev_client; os_type=darwin; arch=arm64; cl=1017595969; auth_method=gcp)');
+  assert.equal(await f.session.identity(result), 'antigravity/cli/1.5.5 (aidev_client; os_type=darwin; arch=arm64; cl=1017970541; auth_method=gcp)');
   assert.equal(f.session.binding(result).length, 64);
 });
 
@@ -156,7 +157,7 @@ test('selects the effective refresh mechanism across native labels and explicit 
             assert.equal(value.project_id, 'native-project');
             assert.equal(value.region, 'native-region');
           }
-          assert.equal(await f.session.identity(result), `antigravity/2.31.0 (aidev_client; os_type=darwin; arch=arm64; cl=1017595969; auth_method=${auth_method})`);
+          assert.equal(await f.session.identity(result), `antigravity/cli/1.5.5 (aidev_client; os_type=darwin; arch=arm64; cl=1017970541; auth_method=${auth_method})`);
         }
         assert.deepEqual(config, originalConfig);
       });
@@ -334,6 +335,44 @@ test('rejects malformed native data and redacts untrusted failure details', asyn
   await assert.rejects(f.session.profile(), error => error.code === 'ERR_NATIVE_FORMAT' && !JSON.stringify(error).includes('test-sensitive-value'));
   f.deps.readCredential = async () => { throw new Error('stderr includes test-sensitive-value'); };
   await assert.rejects(f.freshSession().profile(), error => !String(error.stack).includes('test-sensitive-value'));
+});
+
+test('uses cliPath for identity and never substitutes installed App metadata', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'antigravity-cli-path-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const appPath = join(directory, 'Antigravity.app');
+  const bin = join(appPath, 'Contents/Resources/bin');
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(bin, 'language_server'), 'Built at CL: 9999999999');
+  await writeFile(join(appPath, 'Contents/Info.plist'), '<plist><dict><key>CFBundleShortVersionString</key><string>99.88.77</string></dict></plist>');
+  const cliPath = join(directory, 'selected-agy');
+  await writeFile(cliPath, 'invalid official CLI fixture');
+  const f = fixture();
+  const { metadata: _unused, ...dependencies } = f.deps;
+  const session = createNativeSession({ ...f.sessionOptions, appPath, cliPath, _deps: dependencies });
+  await assert.rejects(session.identity(native()), error => {
+    assert.equal(error.code, process.platform === 'darwin' && ['arm64', 'x64'].includes(process.arch) ? 'ERR_NATIVE_CLI_FORMAT' : 'ERR_NATIVE_CLI_PLATFORM');
+    assert.equal(inspect(error, { depth: null }).includes('99.88.77'), false);
+    assert.equal(inspect(error, { depth: null }).includes('9999999999'), false);
+    return true;
+  });
+  assert.equal(f.calls.renewals, 0);
+});
+
+test('publishes safe CLI metadata errors while redacting untrusted metadata failures', async () => {
+  const f = fixture();
+  f.deps.metadata = async () => { throw new CliMetadataError('ERR_NATIVE_CLI_CHANGED', 'The official Antigravity CLI changed while its identity was being read.'); };
+  await assert.rejects(f.freshSession().identity(native()), { code: 'ERR_NATIVE_CLI_CHANGED', message: /CLI changed/ });
+  const secret = 'synthetic-private-cli-output';
+  f.deps.metadata = async () => { throw Object.assign(new Error(secret), { stdout: secret, stderr: secret, credentials: secret }); };
+  await assert.rejects(f.freshSession().identity(native()), error => {
+    assert.equal(error.code, 'ERR_NATIVE_AUTH');
+    assert.equal(error.stdout, undefined);
+    assert.equal(error.stderr, undefined);
+    assert.equal(error.credentials, undefined);
+    assert.equal(inspect(error, { depth: null }).includes(secret), false);
+    return true;
+  });
 });
 
 test('a failed renewal neither overwrites native credentials nor exposes its body', async () => {

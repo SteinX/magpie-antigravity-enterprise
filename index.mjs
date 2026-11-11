@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto"
 import { createNativeSession } from "./auth.mjs"
 import { PROVIDER, BASE, validateTarget, enterpriseURL, buildPayload, catalogModels, adaptResponse } from "./protocol.mjs"
+import { nativeFetch } from "./transport.mjs"
 
 const CATALOG = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
 const LABEL = "Antigravity Enterprise"
@@ -59,6 +60,7 @@ async function readRequestBody(request) {
 }
 
 export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => {
+  const fetch = options._deps?.fetch ?? nativeFetch
   const createSession = options._deps?.createNativeSession ?? createNativeSession
   let native = createSession(options)
   const trajectories = new Map()
