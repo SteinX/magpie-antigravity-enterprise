@@ -120,7 +120,7 @@ export function catalogModels(catalog) {
       text: true,
       image: info.supportsImages === true || mimes.some((mime) => mime.startsWith("image/")),
       audio: mimes.some((mime) => mime.startsWith("audio/")),
-      video: mimes.some((mime) => mime.startsWith("video/")),
+      video: info.supportsVideo === true || mimes.some((mime) => mime.startsWith("video/")),
       pdf: mimes.includes("application/pdf"),
     }
     return [id, {
@@ -138,7 +138,7 @@ export function catalogModels(catalog) {
       headers: {},
       capabilities: {
         temperature: true,
-        reasoning: info.supportsThinking === true,
+        reasoning: info.supportsThinking === true || info.supportsAdaptiveThinking === true,
         attachment: input.image || input.audio || input.video || input.pdf,
         toolcall: true,
         input,

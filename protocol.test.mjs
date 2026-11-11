@@ -211,6 +211,23 @@ test("catalog keeps every enabled exact API ID and uses upstream limits and medi
   assert.deepEqual(catalogModels({ models: {} }), {})
 })
 
+test("catalog exposes video and adaptive thinking flags without inferring absent capabilities", () => {
+  const models = catalogModels({ models: {
+    "video-only": { supportsVideo: true },
+    "adaptive-only": { supportsAdaptiveThinking: true },
+    "no-flags": {},
+  } })
+  assert.equal(models["video-only"].capabilities.input.video, true)
+  assert.equal(models["video-only"].capabilities.attachment, true)
+  assert.equal(models["video-only"].capabilities.reasoning, false)
+  assert.equal(models["adaptive-only"].capabilities.reasoning, true)
+  assert.equal(models["adaptive-only"].capabilities.input.video, false)
+  assert.equal(models["adaptive-only"].capabilities.attachment, false)
+  assert.equal(models["no-flags"].capabilities.reasoning, false)
+  assert.equal(models["no-flags"].capabilities.input.video, false)
+  assert.equal(models["no-flags"].capabilities.attachment, false)
+})
+
 test("preserves HTTP error responses including status, headers, and body", async () => {
   for (const wantsStream of [false, true]) {
     const upstream = new Response('{"error":{"message":"license required"}}', { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json", "retry-after": "17" } })

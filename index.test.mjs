@@ -15,7 +15,7 @@ const deferred = () => {
   return { promise, resolve }
 }
 
-async function fixture(t, responses = [sse()], { binding = "native-account" } = {}) {
+async function fixture(t, responses = [sse()], { binding = "native-account", onRequest } = {}) {
   const requests = []
   const profiles = []
   const metadata = { projectId: "licensed-project", location: "eu", nativeBinding: "native-account", userTier: "licensed-tier", authMethod: "auto", wifProvider: "" }
@@ -30,13 +30,15 @@ async function fixture(t, responses = [sse()], { binding = "native-account" } = 
   }
   const fetch = async (url, init) => {
     requests.push({ url, ...init, headers: new Headers(init.headers), payload: JSON.parse(init.body) })
+    onRequest?.(requests.at(-1))
     const response = responses[requests.length - 1]
     assert.ok(response, "An unexpected upstream request was made")
+    if (response instanceof Error) throw response
     return response
   }
   const plugin = await AntigravityEnterprisePlugin({}, { _deps: { createNativeSession: () => native, fetch } })
   const client = await plugin.auth.loader(async () => ({ type: "api", metadata }))
-  return { fetch: client.fetch, requests, profiles, metadata, native }
+  return { plugin, fetch: client.fetch, requests, profiles, metadata, native }
 }
 
 async function assertAnswer(response) {
@@ -391,4 +393,215 @@ test("native tool turns increment once and newer full history raises the counter
     }))
   }
   assert.deepEqual(f.requests.map((request) => request.headers.get("x-aicode-request-id")), ["tool-conversation-0", "tool-conversation-1", "tool-conversation-3", "tool-conversation-4"])
+})
+
+const quotaProvider = { models: { "gemini-3.8-flash-low": { id: "gemini-3.8-flash-low" }, "claude-sonnet-4-5": { id: "claude-sonnet-4-5" } } }
+const quotaSummary = { groups: [{ displayName: "All Models", buckets: [
+  { bucketId: "gemini-3.8-flash-low", displayName: "Gemini Flash Low", remainingFraction: 0 },
+  { bucketId: "claude-sonnet-4-5", displayName: "Claude Sonnet", remainingFraction: 1 },
+] }] }
+
+test("quota usage queries the saved selected license project with bound native identity", async (t) => {
+  const f = await fixture(t, [json(quotaSummary)])
+  f.metadata.tierDisplayName = "Verified Enterprise Tier"
+  const profile = f.native.profile
+  f.native.profile = async (options) => ({
+    ...await profile(options), project_id: "native-default-project", region: "global",
+    user_tier: "native-profile-tier", tier_display_name: "Native profile tier",
+  })
+  const result = await f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), { models: {} })
+  assert.equal(result.plan, "Verified Enterprise Tier")
+  assert.equal(Object.hasOwn(result, "signIn"), false)
+  assert.deepEqual(result.windows.map(({ used, models }) => ({ used, models })), [
+    { used: 100, models: ["gemini-3.8-flash-low"] },
+    { used: 0, models: ["claude-sonnet-4-5"] },
+  ])
+  assert.equal(f.requests.length, 1)
+  const sent = f.requests[0]
+  assert.equal(sent.url, "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")
+  assert.equal(sent.method, "POST")
+  assert.deepEqual(sent.payload, { project: "licensed-project" })
+  assert.equal(sent.headers.get("authorization"), "Bearer native-access")
+  assert.equal(sent.headers.get("user-agent"), "antigravity/native-test-client")
+  assert.equal(sent.headers.get("content-type"), "application/json")
+  assert.equal(f.profiles[0].config, f.metadata)
+  assert.equal(f.profiles[0].signal, sent.signal)
+  assert.equal(f.profiles[0].forceRefresh, false)
+})
+
+test("quota usage reads each supplied account afresh instead of retaining loader auth", async (t) => {
+  const f = await fixture(t, [json({ groups: [] }), json({ groups: [] })])
+  const secondMetadata = { ...f.metadata, projectId: "second-licensed-project", location: "us", userTier: "second-tier" }
+  let auth = { type: "api", metadata: f.metadata }
+  const first = await f.plugin.auth.usage(async () => auth, quotaProvider)
+  auth = { type: "api", metadata: secondMetadata }
+  const second = await f.plugin.auth.usage(async () => auth, quotaProvider)
+  assert.equal(first.plan, "licensed-tier")
+  assert.equal(second.plan, "second-tier")
+  assert.deepEqual(f.requests.map((request) => request.payload), [{ project: "licensed-project" }, { project: "second-licensed-project" }])
+  assert.deepEqual(f.profiles.map((options) => options.config), [f.metadata, secondMetadata])
+  assert.deepEqual(first.windows, [])
+  assert.deepEqual(second.windows, [])
+})
+
+test("quota usage reports missing auth and account binding changes as expired without requests", async (t) => {
+  const f = await fixture(t, [], { binding: "other-account" })
+  for (const auth of [undefined, { type: "api" }, { type: "oauth", metadata: f.metadata }]) {
+    const result = await f.plugin.auth.usage(async () => auth, quotaProvider)
+    assert.equal(result.signIn, "expired")
+    assert.match(result.error, /Sign in with the local Antigravity enterprise account/)
+    assert.equal(Object.hasOwn(result, "windows"), false)
+  }
+  assert.equal(f.profiles.length, 0)
+  const changed = await f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider)
+  assert.equal(changed.signIn, "expired")
+  assert.match(changed.error, /account signed in to Antigravity changed/)
+  assert.equal(f.requests.length, 0)
+})
+
+test("quota read 401 expires auth while 403 preserves it without refreshing or fake usage", async (t) => {
+  for (const status of [401, 403]) {
+    const f = await fixture(t, [json({ error: { message: "Sign in again to access this quota resource" } }, status)])
+    const result = await f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider)
+    assert.equal(result.signIn, status === 401 ? "expired" : "kept")
+    assert.match(result.error, new RegExp(`HTTP ${status}`))
+    assert.equal(Object.hasOwn(result, "windows"), false)
+    assert.equal(f.requests.length, 1)
+    assert.deepEqual(f.profiles.map((options) => options.forceRefresh), [false])
+  }
+})
+
+test("quota network, JSON, and structural failures preserve auth and unknown usage", async (t) => {
+  const failures = [
+    [new TypeError("Network unavailable"), /Network unavailable/],
+    [new Response("not JSON", { status: 200 }), /invalid JSON response/],
+    [json({ groups: {} }), /invalid groups list/],
+  ]
+  for (const [response, message] of failures) {
+    const f = await fixture(t, [response])
+    const result = await f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider)
+    assert.equal(result.signIn, "kept")
+    assert.match(result.error, message)
+    assert.equal(Object.hasOwn(result, "windows"), false)
+    assert.equal(f.requests.length, 1)
+  }
+})
+
+test("native auth failures retain their explicit expired or kept sign-in state", async (t) => {
+  for (const signIn of ["expired", undefined]) {
+    const f = await fixture(t, [])
+    f.native.profile = async () => { throw Object.assign(new Error("Native authentication could not be read"), { signIn }) }
+    const result = await f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider)
+    assert.equal(result.signIn, signIn ?? "kept")
+    assert.match(result.error, /Native authentication could not be read/)
+    assert.equal(Object.hasOwn(result, "windows"), false)
+    assert.equal(f.requests.length, 0)
+  }
+})
+
+test("pre-aborted quota reads reject before auth or native work", async (t) => {
+  const f = await fixture(t, [])
+  const controller = new AbortController()
+  const reason = new Error("Cancelled before quota")
+  controller.abort(reason)
+  let authReads = 0
+  await assert.rejects(f.plugin.auth.usage(async () => { authReads++; return { type: "api", metadata: f.metadata } }, quotaProvider, { signal: controller.signal }), (error) => error === reason)
+  assert.equal(authReads, 0)
+  assert.equal(f.profiles.length, 0)
+  assert.equal(f.requests.length, 0)
+})
+
+test("cancelling quota while getAuth is pending rejects promptly and prevents later work", async (t) => {
+  const f = await fixture(t, [])
+  const pendingAuth = deferred()
+  const entered = deferred()
+  const controller = new AbortController()
+  const reason = new Error("Cancelled while reading account")
+  const result = f.plugin.auth.usage(() => { entered.resolve(); return pendingAuth.promise }, quotaProvider, { signal: controller.signal })
+  await entered.promise
+  controller.abort(reason)
+  await assert.rejects(result, (error) => error === reason)
+  pendingAuth.resolve({ type: "api", metadata: f.metadata })
+  await pendingAuth.promise
+  assert.equal(f.profiles.length, 0)
+  assert.equal(f.requests.length, 0)
+})
+
+test("cancelling quota during native binding propagates the same bounded signal", async (t) => {
+  const f = await fixture(t, [])
+  const pendingProfile = deferred()
+  const entered = deferred()
+  const controller = new AbortController()
+  f.native.profile = (options) => { entered.resolve(options); return pendingProfile.promise }
+  const result = f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider, { signal: controller.signal })
+  const options = await entered.promise
+  assert.equal(options.config, f.metadata)
+  const reason = new Error("Cancelled while binding native account")
+  controller.abort(reason)
+  await assert.rejects(result, (error) => error === reason)
+  assert.equal(options.signal.aborted, true)
+  assert.equal(options.signal.reason, reason)
+  pendingProfile.resolve({ token: { access_token: "native-access" } })
+  await pendingProfile.promise
+  assert.equal(f.requests.length, 0)
+})
+
+test("one overall 30-second quota deadline includes identity and the upstream request", async (t) => {
+  const deadline = new AbortController()
+  const delays = []
+  t.mock.method(AbortSignal, "timeout", (milliseconds) => { delays.push(milliseconds); return deadline.signal })
+  const pendingResponse = deferred()
+  const enteredRequest = deferred()
+  const f = await fixture(t, [pendingResponse.promise], { onRequest: enteredRequest.resolve })
+  const pendingIdentity = deferred()
+  const enteredIdentity = deferred()
+  f.native.identity = () => { enteredIdentity.resolve(); return pendingIdentity.promise }
+  const controller = new AbortController()
+  const result = f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider, { signal: controller.signal })
+  await enteredIdentity.promise
+  assert.deepEqual(delays, [30_000])
+  const signal = f.profiles[0].signal
+  assert.equal(signal.aborted, false)
+  pendingIdentity.resolve("antigravity/native-test-client")
+  await enteredRequest.promise
+  assert.equal(f.requests.length, 1)
+  assert.equal(f.requests[0].signal, signal)
+  const reason = new DOMException("Quota deadline exceeded", "TimeoutError")
+  deadline.abort(reason)
+  await assert.rejects(result, (error) => error === reason)
+  assert.equal(signal.aborted, true)
+  assert.deepEqual(delays, [30_000])
+  pendingResponse.resolve(json({ groups: [] }))
+})
+
+test("cancelling quota during header identity lookup never starts an upstream request", async (t) => {
+  const f = await fixture(t, [])
+  const pendingIdentity = deferred()
+  const entered = deferred()
+  f.native.identity = () => { entered.resolve(); return pendingIdentity.promise }
+  const controller = new AbortController()
+  const result = f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider, { signal: controller.signal })
+  await entered.promise
+  controller.abort()
+  await assert.rejects(result, { name: "AbortError" })
+  pendingIdentity.resolve("antigravity/native-test-client")
+  await pendingIdentity.promise
+  await Promise.resolve()
+  assert.equal(f.requests.length, 0)
+})
+
+test("quota cancellation covers a response body that has not finished parsing", async (t) => {
+  const parsing = deferred()
+  let source
+  const response = new Response(new ReadableStream({
+    start(controller) { source = controller; controller.enqueue(encoder.encode('{"groups":')) },
+    pull() { parsing.resolve() },
+  }), { headers: { "content-type": "application/json" } })
+  const f = await fixture(t, [response])
+  const controller = new AbortController()
+  const result = f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider, { signal: controller.signal })
+  await parsing.promise
+  controller.abort()
+  await assert.rejects(result, { name: "AbortError" })
+  source.error(new DOMException("Response aborted", "AbortError"))
 })

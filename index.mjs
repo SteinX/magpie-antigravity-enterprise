@@ -2,8 +2,10 @@ import { createHash, randomUUID } from "node:crypto"
 import { createNativeSession } from "./auth.mjs"
 import { PROVIDER, BASE, validateTarget, enterpriseURL, buildPayload, catalogModels, adaptResponse } from "./protocol.mjs"
 import { nativeFetch } from "./transport.mjs"
+import { quotaUsage } from "./usage.mjs"
 
 const CATALOG = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+const QUOTA = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
 const LABEL = "Antigravity Enterprise"
 
 function failed(message, status = 400, signIn) {
@@ -18,6 +20,20 @@ function authError(message) {
 
 function requestSignal(signal) {
   return signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000)
+}
+
+async function withSignal(task, signal) {
+  signal.throwIfAborted()
+  let abort
+  const cancelled = new Promise((_, reject) => {
+    abort = () => reject(signal.reason)
+    signal.addEventListener("abort", abort, { once: true })
+  })
+  try {
+    return await Promise.race([task(), cancelled])
+  } finally {
+    signal.removeEventListener("abort", abort)
+  }
 }
 
 function boundedMap(map, key, value) {
@@ -164,6 +180,29 @@ export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => 
     auth: {
       provider: PROVIDER,
       methods: [method],
+      async usage(getAuth, _provider, { signal } = {}) {
+        const boundedSignal = requestSignal(signal)
+        try {
+          return await withSignal(async () => {
+            const auth = await getAuth()
+            boundedSignal.throwIfAborted()
+            const { profile, target, metadata } = await signedIn(auth, boundedSignal)
+            const headers = await headersFor(profile, boundedSignal)
+            boundedSignal.throwIfAborted()
+            const response = await fetch(QUOTA, {
+              method: "POST", headers, signal: boundedSignal,
+              body: JSON.stringify({ project: target.projectId }),
+            })
+            const summary = await readJSON(response, "Fetching enterprise quota")
+            boundedSignal.throwIfAborted()
+            return quotaUsage(summary, { metadata })
+          }, boundedSignal)
+        } catch (error) {
+          boundedSignal.throwIfAborted()
+          if (error?.name === "AbortError") throw error
+          return { error: error.message, signIn: error.signIn === "expired" ? "expired" : "kept" }
+        }
+      },
       async loader(getAuth) {
         if (!(await getAuth())?.metadata?.nativeBinding) return {}
         return {
