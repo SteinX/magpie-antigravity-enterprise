@@ -30,8 +30,31 @@ async function readJSON(response, operation) {
   return result
 }
 
+async function readRequestBody(request) {
+  const { signal, body } = request
+  signal.throwIfAborted()
+  if (!body) return JSON.parse("")
+  const reader = body.getReader()
+  const abort = () => { void reader.cancel(signal.reason).catch(() => {}) }
+  signal.addEventListener("abort", abort, { once: true })
+  try {
+    const decoder = new TextDecoder()
+    let text = ""
+    while (true) {
+      const { done, value } = await reader.read()
+      signal.throwIfAborted()
+      if (done) return JSON.parse(text + decoder.decode())
+      text += decoder.decode(value, { stream: true })
+    }
+  } finally {
+    signal.removeEventListener("abort", abort)
+    reader.releaseLock()
+  }
+}
+
 export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => {
-  let native = createNativeSession(options)
+  const createSession = options._deps?.createNativeSession ?? createNativeSession
+  let native = createSession(options)
   const trajectories = new Map()
   let sequence = 0
 
@@ -96,7 +119,7 @@ export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => 
       const prompt = prompts.find((item) => !(item.key in inputs) && (!item.when || inputs[item.when.key] === item.when.value))
       if (!prompt) return null
       if (prompt.key === "projectId" || prompt.key === "location" || prompt.key === "wifProvider") {
-        const profile = await createNativeSession(options).profile()
+        const profile = await createSession(options).profile()
         const suggestion = prompt.key === "projectId" ? profile.project_id : prompt.key === "location" ? profile.region : profile.wif_provider
         return { ...prompt, placeholder: suggestion || prompt.placeholder }
       }
@@ -108,7 +131,7 @@ export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => 
         if (!["auto", "gcp", "wif"].includes(inputs.authMethod ?? "auto")) throw new Error("Choose a supported authentication method")
         if (inputs.authMethod === "wif" && !inputs.wifProvider?.trim()) throw new Error("Enter your WIF provider")
         const config = { ...target, authMethod: inputs.authMethod ?? "auto", wifProvider: inputs.wifProvider?.trim() ?? "" }
-        const signingNative = createNativeSession(options)
+        const signingNative = createSession(options)
         const profile = await signingNative.profile({ signal, config })
         const available = await licenses(profile, signal)
         const license = available.find((item) => item.projectId === target.projectId && item.location === target.location)
@@ -137,17 +160,20 @@ export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => 
         return {
           baseURL: BASE,
           async fetch(input, init = {}) {
+            let signal
             try {
-              const signal = init.signal
-              signal?.throwIfAborted()
-              const match = /\/models\/([^/:?]+):(streamGenerateContent|generateContent)(?:\?|$)/.exec(String(input))
+              const request = new Request(input, init)
+              signal = request.signal
+              signal.throwIfAborted()
+              const match = /\/models\/([^/:?]+):(streamGenerateContent|generateContent)(?:\?|$)/.exec(request.url)
               if (!match) return failed("This provider supports Gemini generateContent and streamGenerateContent requests", 404)
               const model = decodeURIComponent(match[1])
-              const body = typeof init.body === "string" ? JSON.parse(init.body) : JSON.parse(new TextDecoder().decode(init.body))
+              if (request.method !== "POST") return failed("This provider requires POST for Gemini generation requests", 405)
+              const body = await readRequestBody(request)
               const auth = await getAuth()
               let state = await signedIn(auth, signal)
               const payload = buildPayload(body, model, state.metadata.userTier)
-              const id = trajectory(body, state.metadata, init.headers)
+              const id = trajectory(body, state.metadata, request.headers)
               const send = async () => {
                 const headers = await headersFor(state.profile, signal)
                 headers.Accept = "text/event-stream"
@@ -162,9 +188,9 @@ export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => 
                 state = await signedIn(auth, signal, true)
                 response = await send()
               }
-              return await adaptResponse(response, match[2] === "streamGenerateContent")
+              return await adaptResponse(response, match[2] === "streamGenerateContent", { signal })
             } catch (error) {
-              if (init.signal?.aborted || error.name === "AbortError") throw error
+              if (signal?.aborted || error.name === "AbortError") throw error
               return failed(error.message, error.signIn ? 401 : error instanceof SyntaxError ? 400 : 502, error.signIn)
             }
           },

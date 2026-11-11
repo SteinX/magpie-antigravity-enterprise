@@ -28,7 +28,7 @@ function fixture(initial = native(), options = {}) {
   let raw = encode(initial);
   let queue = Promise.resolve();
   const principalMap = new Map();
-  const calls = { reads: 0, commits: 0, renewals: 0, userinfo: 0, forms: [], signals: [] };
+  const calls = { reads: 0, commits: 0, oauthConfigs: 0, renewals: 0, userinfo: 0, urls: [], forms: [], signals: [] };
   const deps = {
     now: () => NOW,
     metadata: async () => ({ version: '2.31.0', cl: '1017595969', platform: 'darwin', arch: 'arm64' }),
@@ -55,15 +55,19 @@ function fixture(initial = native(), options = {}) {
         } });
       } finally { released.resolve(); }
     },
-    oauthConfig: async value => value.wif_provider
-      ? { url: 'https://sts.googleapis.com/v1/oauthtoken', clientId: 'test-workforce-client' }
-      : { url: 'https://oauth2.googleapis.com/token', clientId: 'test-cloud-client', clientSecret: 'test-public-client-config' },
+    oauthConfig: async value => {
+      calls.oauthConfigs++;
+      return value.wif_provider
+        ? { url: 'https://sts.googleapis.com/v1/oauthtoken', clientId: 'test-workforce-client' }
+        : { url: 'https://oauth2.googleapis.com/token', clientId: 'test-cloud-client', clientSecret: 'test-public-client-config' };
+    },
     fetch: async (url, request) => {
       if (url.endsWith('/userinfo')) {
         calls.userinfo++;
         return options.userinfo ? options.userinfo(url, request) : json({ id: 'account-A' });
       }
       calls.renewals++;
+      calls.urls.push(url);
       calls.forms.push(Object.fromEntries(request.body));
       calls.signals.push(request.signal);
       return options.refresh ? options.refresh(url, request) : json({ access_token: `renewed-access-${calls.renewals}`, expires_in: 3600 });
@@ -105,12 +109,86 @@ test('refreshes only below the five-minute boundary', async () => {
   assert.equal(f.calls.commits, 1);
 });
 
-test('rejects explicit authentication/provider mismatches before renewal', async () => {
-  const f = fixture(native({ wif_provider: 'native-provider' }));
-  await assert.rejects(f.session.profile({ forceRefresh: true, config: { authMethod: 'wif' } }), { code: 'ERR_NATIVE_ACCOUNT_CHANGED' });
-  await assert.rejects(f.session.profile({ forceRefresh: true, config: { authMethod: 'auto', wifProvider: 'other-provider' } }), { code: 'ERR_NATIVE_ACCOUNT_CHANGED' });
-  assert.equal(f.calls.renewals, 0);
-  assert.equal(f.calls.commits, 0);
+test('selects the effective refresh mechanism across native labels and explicit choices', async t => {
+  const profiles = [
+    { auth_method: 'gcp', wif_provider: '', effective: 'gcp' },
+    { auth_method: 'gcp', wif_provider: 'native-provider', effective: 'wif' },
+    { auth_method: 'wif', wif_provider: '', effective: undefined },
+    { auth_method: 'wif', wif_provider: 'native-provider', effective: 'wif' },
+    { auth_method: 'business_licensed_enterprise', wif_provider: '', effective: 'gcp' },
+    { auth_method: 'business_licensed_enterprise', wif_provider: 'native-provider', effective: 'wif' },
+  ];
+  for (const { auth_method, wif_provider, effective } of profiles) {
+    for (const authMethod of ['auto', 'gcp', 'wif']) {
+      await t.test(`${auth_method}, provider ${wif_provider ? 'present' : 'absent'}, choice ${authMethod}`, async () => {
+        const f = fixture(native({ auth_method, wif_provider }));
+        const original = f.value;
+        const config = { authMethod, wifProvider: wif_provider, projectId: 'caller-project', location: 'caller-location' };
+        const originalConfig = structuredClone(config);
+        if (!effective || (authMethod !== 'auto' && authMethod !== effective)) {
+          await assert.rejects(f.session.profile({ forceRefresh: true, config }), {
+            code: effective ? 'ERR_NATIVE_ACCOUNT_CHANGED' : 'ERR_NATIVE_METHOD',
+          });
+          assert.equal(f.calls.oauthConfigs, 0);
+          assert.equal(f.calls.renewals, 0);
+          assert.equal(f.calls.userinfo, 0);
+          assert.equal(f.calls.commits, 0);
+          assert.equal(f.principalMap.size, 0);
+          assert.deepEqual(f.value, original);
+        } else {
+          const result = await f.session.profile({ forceRefresh: true, config });
+          assert.equal(f.calls.oauthConfigs, 1);
+          assert.equal(f.calls.renewals, 1);
+          assert.equal(f.calls.commits, 1);
+          assert.deepEqual(f.calls.urls, [effective === 'wif' ? 'https://sts.googleapis.com/v1/oauthtoken' : 'https://oauth2.googleapis.com/token']);
+          assert.equal(f.calls.forms[0].client_id, effective === 'wif' ? 'test-workforce-client' : 'test-cloud-client');
+          assert.equal('client_secret' in f.calls.forms[0], effective === 'gcp');
+          for (const value of [result, f.value]) {
+            assert.equal(value.auth_method, auth_method);
+            assert.equal(value.wif_provider, wif_provider);
+            assert.equal(value.project_id, 'native-project');
+            assert.equal(value.region, 'native-region');
+          }
+          assert.equal(await f.session.identity(result), `antigravity/2.31.0 (aidev_client; os_type=darwin; arch=arm64; cl=1017595969; auth_method=${auth_method})`);
+        }
+        assert.deepEqual(config, originalConfig);
+      });
+    }
+  }
+});
+
+test('rejects provider mismatches before automatic or forced renewal', async t => {
+  for (const forceRefresh of [false, true]) {
+    for (const [auth_method, wif_provider, wifProvider] of [
+      ['gcp', '', 'unexpected-provider'],
+      ['gcp', 'native-provider', 'other-provider'],
+      ['wif', 'native-provider', 'other-provider'],
+      ['business_licensed_enterprise', '', 'unexpected-provider'],
+      ['business_licensed_enterprise', 'native-provider', 'other-provider'],
+    ]) {
+      await t.test(`${auth_method}, provider ${wif_provider ? 'present' : 'absent'}, forced ${forceRefresh}`, async () => {
+        const f = fixture(native({ auth_method, wif_provider, token: { ...native().token, expiry: new Date(NOW - 1).toISOString() } }));
+        const original = f.value;
+        await assert.rejects(f.session.profile({ forceRefresh, config: { authMethod: 'auto', wifProvider } }), { code: 'ERR_NATIVE_ACCOUNT_CHANGED' });
+        assert.equal(f.calls.oauthConfigs, 0);
+        assert.equal(f.calls.renewals, 0);
+        assert.equal(f.calls.userinfo, 0);
+        assert.equal(f.calls.commits, 0);
+        assert.equal(f.principalMap.size, 0);
+        assert.deepEqual(f.value, original);
+      });
+    }
+  }
+});
+
+test('rejects unsupported native labels even when a provider is present', async () => {
+  for (const wif_provider of ['', 'native-provider']) {
+    const f = fixture(native({ auth_method: 'unsupported', wif_provider }));
+    await assert.rejects(f.session.profile({ forceRefresh: true, config: { authMethod: 'auto' } }), { code: 'ERR_NATIVE_METHOD' });
+    assert.equal(f.calls.oauthConfigs, 0);
+    assert.equal(f.calls.renewals, 0);
+    assert.equal(f.calls.commits, 0);
+  }
 });
 
 test('retains the binding when writer, project, or region changes for the same account', async () => {
@@ -259,18 +337,54 @@ test('a failed renewal neither overwrites native credentials nor exposes its bod
   assert.equal(f.calls.commits, 0);
 });
 
-test('uses installed WIF client evidence and gives nonempty native provider precedence', async t => {
+test('uses installed WIF client evidence for every supported native label', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'antigravity-client-fixture-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const bin = join(directory, 'Contents/Resources/bin');
   await mkdir(bin, { recursive: true });
   await writeFile(join(bin, 'language_server'), 'native binary fixture a2a6f0e3e-3ff0-462b-869a-47277df4c806');
-  const f = fixture(native({ auth_method: 'gcp', wif_provider: 'native-workforce-provider' }));
-  const { oauthConfig: _unused, ...dependencies } = f.deps;
-  const session = createNativeSession({ ...f.sessionOptions, appPath: directory, _deps: dependencies });
-  await session.profile({ forceRefresh: true, config: { authMethod: 'auto', wifProvider: '' } });
-  assert.equal(f.calls.forms[0].client_id, 'a2a6f0e3e-3ff0-462b-869a-47277df4c806');
-  assert.equal('client_secret' in f.calls.forms[0], false);
+  for (const auth_method of ['gcp', 'wif', 'business_licensed_enterprise']) {
+    for (const authMethod of ['auto', 'wif']) {
+      await t.test(`${auth_method}, choice ${authMethod}`, async () => {
+        const f = fixture(native({ auth_method, wif_provider: 'native-workforce-provider' }));
+        const { oauthConfig: _unused, ...dependencies } = f.deps;
+        const session = createNativeSession({ ...f.sessionOptions, appPath: directory, _deps: dependencies });
+        const result = await session.profile({ forceRefresh: true, config: { authMethod, wifProvider: '' } });
+        assert.deepEqual(f.calls.urls, ['https://sts.googleapis.com/v1/oauthtoken']);
+        assert.equal(f.calls.forms[0].client_id, 'a2a6f0e3e-3ff0-462b-869a-47277df4c806');
+        assert.equal('client_secret' in f.calls.forms[0], false);
+        assert.equal(result.auth_method, auth_method);
+      });
+    }
+  }
+});
+
+test('reports missing installed OAuth evidence for the effective mechanism before renewal', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'antigravity-missing-client-fixture-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const profiles = [
+    { auth_method: 'gcp', wif_provider: '', authMethod: 'gcp', message: /supported enterprise OAuth configuration/ },
+    { auth_method: 'business_licensed_enterprise', wif_provider: '', authMethod: 'gcp', message: /supported enterprise OAuth configuration/ },
+    { auth_method: 'gcp', wif_provider: 'native-provider', authMethod: 'wif', message: /expected workforce OAuth client/ },
+    { auth_method: 'wif', wif_provider: 'native-provider', authMethod: 'wif', message: /expected workforce OAuth client/ },
+    { auth_method: 'business_licensed_enterprise', wif_provider: 'native-provider', authMethod: 'wif', message: /expected workforce OAuth client/ },
+  ];
+  for (const [index, { auth_method, wif_provider, authMethod, message }] of profiles.entries()) {
+    await t.test(`${auth_method}, effective ${authMethod}`, async () => {
+      const appPath = join(directory, String(index));
+      const bin = join(appPath, 'Contents/Resources/bin');
+      await mkdir(bin, { recursive: true });
+      await writeFile(join(bin, 'language_server'), 'native binary fixture without supported OAuth configuration');
+      const f = fixture(native({ auth_method, wif_provider }));
+      const original = f.value;
+      const { oauthConfig: _unused, ...dependencies } = f.deps;
+      const session = createNativeSession({ ...f.sessionOptions, appPath, _deps: dependencies });
+      await assert.rejects(session.profile({ forceRefresh: true, config: { authMethod } }), { code: 'ERR_NATIVE_CLIENT', message });
+      assert.equal(f.calls.renewals, 0);
+      assert.equal(f.calls.commits, 0);
+      assert.deepEqual(f.value, original);
+    });
+  }
 });
 
 test('persists a rotated native token even when nonsecret binding storage fails', async () => {

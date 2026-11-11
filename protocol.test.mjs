@@ -72,20 +72,100 @@ test("builds a flat native request with authoritative selected model and tier", 
   assert.deepEqual(buildPayload({ system_instruction: body.system_instruction }, "m", "t").systemInstruction, body.system_instruction)
 })
 
-test("normalizes schema spelling and gives parametersJsonSchema precedence without mutating input", () => {
+test("preserves explicit JSON Schema and prefers it over a conflicting native schema without mutating input", () => {
   const jsonSchema = { type: "object", properties: { path: { type: "string", description: "File path" } }, required: ["path"] }
   const body = {
     tools: [{ functionDeclarations: [
-      { name: "read_file", description: "Read", parameters: { type: "string" }, parametersJsonSchema: jsonSchema },
-      { name: "already_native", parameters: { type: "object", properties: {} } },
+      { name: "read_file", description: "Read", parameters: { type: "STRING" }, parametersJsonSchema: jsonSchema },
+      { name: "json_only", parametersJsonSchema: jsonSchema },
     ] }, { googleSearch: {} }],
   }
   const before = structuredClone(body)
   const payload = buildPayload(body, "model", "tier")
-  assert.deepEqual(payload.tools[0].functionDeclarations[0], { name: "read_file", description: "Read", parameters: jsonSchema })
-  assert.deepEqual(payload.tools[0].functionDeclarations[1], body.tools[0].functionDeclarations[1])
+  for (const declaration of payload.tools[0].functionDeclarations) {
+    assert.equal(Object.hasOwn(declaration, "parameters"), false)
+    assert.deepEqual(declaration.parametersJsonSchema.properties.path, { type: "string", description: "File path" })
+    assert.deepEqual(declaration.parametersJsonSchema.required, ["path"])
+  }
+  assert.equal(payload.tools[0].functionDeclarations[0].name, "read_file")
+  assert.equal(payload.tools[0].functionDeclarations[0].description, "Read")
   assert.deepEqual(payload.tools[1], { googleSearch: {} })
   assert.deepEqual(body, before)
+})
+
+test("keeps native Google Schema types, nullable, enum, and property ordering in parameters", () => {
+  const parameters = {
+    type: "OBJECT",
+    properties: {
+      mode: { type: "STRING", format: "enum", enum: ["FAST", "EXACT"], nullable: true },
+      items: { type: "ARRAY", items: { anyOf: [{ type: "STRING" }, { type: "INTEGER" }] } },
+      $ref: { type: "STRING", default: "A property name is not a schema keyword" },
+      metadata: { type: "OBJECT", default: { $defs: { preserved: true }, type: ["arbitrary", "data"] }, example: { additionalProperties: false } },
+    },
+    required: ["mode"],
+    propertyOrdering: ["mode", "items", "$ref", "metadata"],
+  }
+  const output = buildPayload({ tools: [{ functionDeclarations: [{ name: "native", parameters }] }] }, "model", "tier").tools[0].functionDeclarations[0]
+  assert.equal(Object.hasOwn(output, "parametersJsonSchema"), false)
+  assert.equal(output.parameters.type, "OBJECT")
+  assert.deepEqual(output.parameters.properties.mode, { type: "STRING", format: "enum", enum: ["FAST", "EXACT"], nullable: true })
+  assert.deepEqual(output.parameters.properties.items.items.anyOf, [{ type: "STRING" }, { type: "INTEGER" }])
+  assert.deepEqual(output.parameters.propertyOrdering, ["mode", "items", "$ref", "metadata"])
+  assert.deepEqual(output.parameters.properties.metadata.default, { $defs: { preserved: true }, type: ["arbitrary", "data"] })
+})
+
+test("routes JSON Schema constructs nested in legacy parameters without deleting their semantics", () => {
+  const cases = [
+    { type: "object", properties: { value: { type: ["string", "null"] } } },
+    { type: "object", properties: { values: { type: "array", items: { oneOf: [{ type: "string" }, { type: "number" }] } } } },
+    { type: "object", properties: { value: { anyOf: [{ type: "string" }, { const: 42 }] } } },
+    { type: "object", properties: { value: { enum: [1, 2, null] } } },
+    { type: "object", additionalProperties: false },
+    { type: "object", properties: { forbidden: false } },
+  ]
+  for (const parameters of cases) {
+    const before = structuredClone(parameters)
+    const declaration = buildPayload({ tools: [{ functionDeclarations: [{ name: "json", parameters }] }] }, "model", "tier").tools[0].functionDeclarations[0]
+    assert.equal(Object.hasOwn(declaration, "parameters"), false)
+    assert.deepEqual(declaration.parametersJsonSchema, before)
+    assert.deepEqual(parameters, before)
+  }
+})
+
+// The parent probe sent this same schema to the enterprise endpoint: parameters
+// returned HTTP 400; parametersJsonSchema returned HTTP 200 without rewriting it.
+test("preserves the enterprise-probed complex schema in the JSON Schema parameter field", () => {
+  const schema = {
+    type: "object",
+    $defs: { Item: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
+    properties: {
+      item: { $ref: "#/$defs/Item" },
+      choice: { anyOf: [{ type: "string" }, { type: "integer" }] },
+      optional: { type: ["string", "null"] },
+      options: { type: "object", additionalProperties: { type: "string" } },
+    },
+    required: ["item"],
+    additionalProperties: false,
+  }
+  const before = structuredClone(schema)
+  const tools = [{ functionDeclarations: [
+    { name: "legacy_schema", parameters: schema },
+    { name: "explicit_json_schema", parametersJsonSchema: schema },
+  ] }]
+  const declarations = buildPayload({ tools }, "model", "tier").tools[0].functionDeclarations
+  for (const declaration of declarations) {
+    assert.equal(Object.hasOwn(declaration, "parameters"), false)
+    const output = declaration.parametersJsonSchema
+    assert.equal(output.type, "object")
+    assert.equal(output.properties.item.$ref, "#/$defs/Item")
+    assert.deepEqual(output.$defs.Item, { type: "object", properties: { name: { type: "string" } }, required: ["name"] })
+    assert.deepEqual(output.properties.choice.anyOf, [{ type: "string" }, { type: "integer" }])
+    assert.deepEqual(output.properties.optional.type, ["string", "null"])
+    assert.deepEqual(output.properties.options.additionalProperties, { type: "string" })
+    assert.equal(output.additionalProperties, false)
+    assert.deepEqual(output.required, ["item"])
+  }
+  assert.deepEqual(schema, before)
 })
 
 test("replays real signatures and tool IDs exactly and leaves unsigned calls unsigned", () => {
@@ -134,7 +214,7 @@ test("catalog keeps every enabled exact API ID and uses upstream limits and medi
 test("preserves HTTP error responses including status, headers, and body", async () => {
   for (const wantsStream of [false, true]) {
     const upstream = new Response('{"error":{"message":"license required"}}', { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json", "retry-after": "17" } })
-    const result = adaptResponse(upstream, wantsStream)
+    const result = await adaptResponse(upstream, wantsStream)
     assert.equal(result, upstream)
     assert.equal(result.status, 403)
     assert.equal(result.statusText, "Forbidden")
@@ -146,7 +226,7 @@ test("preserves HTTP error responses including status, headers, and body", async
 test("passes direct SSE through without consuming or rewriting it", async () => {
   const raw = event({ candidates: [{ content: { parts: [{ text: "unchanged" }] } }] })
   const upstream = sseResponse(raw)
-  const result = adaptResponse(upstream, true)
+  const result = await adaptResponse(upstream, true)
   assert.equal(result, upstream)
   assert.equal(result.bodyUsed, false)
   assert.equal(result.body.locked, false)
@@ -155,7 +235,7 @@ test("passes direct SSE through without consuming or rewriting it", async () => 
 
 test("leaves native JSON success responses intact", async () => {
   const upstream = new Response('{"candidates":[]}', { headers: { "content-type": "application/json" } })
-  assert.equal(adaptResponse(upstream, false), upstream)
+  assert.equal(await adaptResponse(upstream, false), upstream)
   assert.equal(await upstream.text(), '{"candidates":[]}')
 })
 
@@ -169,7 +249,7 @@ test("aggregates fragmented SSE preserving parallel tool calls, real signatures,
     { candidates: [{ index: 0, content: { parts: [unsignedCall, signedText, { text: " more text" }] } }] },
     { candidates: [{ index: 0, finishReason: "STOP", finishMessage: "Finished", safetyRatings: [{ category: "HARM_CATEGORY_HARASSMENT", probability: "NEGLIGIBLE" }] }], usageMetadata: { candidatesTokenCount: 20, totalTokenCount: 120 } },
   ]
-  const result = adaptResponse(sseResponse(": heartbeat\r\n\r\n" + chunks.map((chunk) => event(chunk, "\r\n\r\n")).join("") + "data: [DONE]\r\n\r\n", [1]), false)
+  const result = await adaptResponse(sseResponse(": heartbeat\r\n\r\n" + chunks.map((chunk) => event(chunk, "\r\n\r\n")).join("") + "data: [DONE]\r\n\r\n", [1]), false)
   assert.equal(result.headers.get("content-type"), "application/json")
   assert.equal(result.headers.get("x-request-id"), "request-42")
   const output = await result.json()
@@ -194,7 +274,7 @@ test("collects candidates by index and supports multiline events and an untermin
     { index: 1, finishReason: "STOP" },
   ], promptFeedback: { safetyRatings: [] } }
   const multiline = JSON.stringify(first, null, 2).split("\n").map((line) => `data: ${line}`).join("\n") + "\n\n"
-  const output = await adaptResponse(sseResponse(multiline + event(second, "")), false).json()
+  const output = await (await adaptResponse(sseResponse(multiline + event(second, "")), false)).json()
   assert.deepEqual(output.candidates.map((candidate) => candidate.index), [0, 1])
   assert.deepEqual(output.candidates.map((candidate) => candidate.content.parts), [[{ text: "first choice" }], [{ text: "second" }]])
   assert.deepEqual(output.candidates.map((candidate) => candidate.finishReason), ["MAX_TOKENS", "STOP"])
@@ -203,25 +283,26 @@ test("collects candidates by index and supports multiline events and an untermin
 
 test("retains blocked prompt feedback without inventing a model completion", async () => {
   const promptFeedback = { blockReason: "SAFETY", blockReasonMessage: "Blocked upstream" }
-  const output = await adaptResponse(sseResponse(event({ promptFeedback, usageMetadata: { promptTokenCount: 9 } })), false).json()
+  const output = await (await adaptResponse(sseResponse(event({ promptFeedback, usageMetadata: { promptTokenCount: 9 } })), false)).json()
   assert.deepEqual(output, { candidates: [], promptFeedback, usageMetadata: { promptTokenCount: 9 } })
 })
 
-test("cancels the upstream body when the JSON consumer cancels during aggregation", async () => {
+test("aborting nonstream aggregation rejects with the caller reason and cancels upstream", async () => {
+  const abort = new AbortController()
   let signalPull
   const pulled = new Promise((resolve) => { signalPull = resolve })
   let cancellationReason
   const upstream = new Response(new ReadableStream({
+    start(controller) { controller.enqueue(encoder.encode(event({ candidates: [{ content: { parts: [{ text: "partial" }] } }] }))) },
     pull() { signalPull() },
     cancel(reason) { cancellationReason = reason },
   }), { headers: { "content-type": "text/event-stream" } })
-  const reader = adaptResponse(upstream, false).body.getReader()
-  const pendingRead = reader.read()
+  const pending = adaptResponse(upstream, false, { signal: abort.signal })
   await pulled
-  const reason = new Error("Consumer stopped")
-  await reader.cancel(reason)
+  const reason = new DOMException("Consumer stopped", "AbortError")
+  abort.abort(reason)
+  await assert.rejects(pending, (error) => error === reason)
   assert.equal(cancellationReason, reason)
-  assert.deepEqual(await pendingRead, { value: undefined, done: true })
 })
 
 test("preserves streaming cancellation through the original body", async () => {
@@ -230,7 +311,7 @@ test("preserves streaming cancellation through the original body", async () => {
     cancel(reason) { cancellationReason = reason },
   }), { headers: { "content-type": "text/event-stream" } })
   const reason = new Error("Stream reader stopped")
-  await adaptResponse(upstream, true).body.cancel(reason)
+  await (await adaptResponse(upstream, true)).body.cancel(reason)
   assert.equal(cancellationReason, reason)
 })
 
@@ -239,18 +320,143 @@ test("propagates an upstream abort while aggregating instead of returning partia
   let signalPull
   const pulled = new Promise((resolve) => { signalPull = resolve })
   const upstream = new Response(new ReadableStream({
-    start(controller) { abort.signal.addEventListener("abort", () => controller.error(abort.signal.reason), { once: true }) },
+    start(controller) {
+      controller.enqueue(encoder.encode(event({ candidates: [{ content: { parts: [{ text: "partial" }] } }] })))
+      abort.signal.addEventListener("abort", () => controller.error(abort.signal.reason), { once: true })
+    },
     pull() { signalPull() },
   }), { headers: { "content-type": "text/event-stream" } })
-  const output = adaptResponse(upstream, false)
-  const reading = output.text()
+  const pending = adaptResponse(upstream, false)
   await pulled
   const reason = new DOMException("Request aborted", "AbortError")
   abort.abort(reason)
-  await assert.rejects(reading, (error) => error === reason)
+  await assert.rejects(pending, (error) => error === reason)
 })
 
 test("does not hide malformed upstream events as a successful empty response", async () => {
-  const output = adaptResponse(sseResponse('data: {"candidates":broken}\n\n'), false)
-  await assert.rejects(output.json(), SyntaxError)
+  await assert.rejects(adaptResponse(sseResponse('data: {"candidates":broken}\n\n'), false), SyntaxError)
+})
+
+// These error fixtures exercise the generic Google RPC error contract; they
+// are not captured Antigravity App responses or evidence of model entitlement.
+test("returns a Google error before any content as a non-success JSON response", async () => {
+  const error = {
+    code: 403,
+    status: "PERMISSION_DENIED",
+    message: "The caller does not have permission",
+    details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "IAM_PERMISSION_DENIED", domain: "googleapis.com", metadata: { permission: "aiplatform.endpoints.predict" } }],
+  }
+  const result = await adaptResponse(sseResponse(event({ error })), false)
+  assert.equal(result.status, 403)
+  assert.equal(result.ok, false)
+  assert.equal(result.headers.get("content-type"), "application/json")
+  assert.deepEqual(await result.json(), { error })
+})
+
+test("discards partial content when a later Google error ends the stream and cancels upstream", async () => {
+  const error = { code: 429, status: "RESOURCE_EXHAUSTED", message: "Quota exceeded", details: [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "5s" }] }
+  let canceled = false
+  const upstream = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(event({ candidates: [{ index: 0, content: { parts: [{ text: "Incomplete answer" }] } }] })))
+      controller.enqueue(encoder.encode(event({ error }) + event({ candidates: [{ index: 0, finishReason: "STOP" }] })))
+    },
+    cancel() { canceled = true },
+  }), { headers: { "content-type": "text/event-stream" } })
+  const result = await adaptResponse(upstream, false)
+  assert.equal(result.status, 429)
+  assert.deepEqual(await result.json(), { error })
+  assert.equal(canceled, true)
+})
+
+test("handles named error events with wrapped or direct Google errors before or after partial content", async () => {
+  const error = { code: 503, status: "UNAVAILABLE", message: "The service is temporarily unavailable" }
+  for (const partial of ["", event({ candidates: [{ content: { parts: [{ text: "partial" }] } }] })]) {
+    for (const payload of [{ error }, error]) {
+      const raw = partial + "event: error\r\n" + event(payload, "\r\n\r\n") + event({ candidates: [{ finishReason: "STOP" }] })
+      const result = await adaptResponse(sseResponse(raw, [1]), false)
+      assert.equal(result.status, 503)
+      assert.deepEqual(await result.json(), { error })
+    }
+  }
+})
+
+test("uses a canonical Google status when the error has no HTTP code", async () => {
+  const error = { status: "DEADLINE_EXCEEDED", message: "Request deadline exceeded" }
+  const result = await adaptResponse(sseResponse(event({ error })), false)
+  assert.equal(result.status, 504)
+  assert.deepEqual(await result.json(), { error })
+})
+
+test("fails closed on malformed Google errors and named error payloads", async () => {
+  const malformed = [
+    event({ error: null }),
+    event({ error: "Unavailable" }),
+    event({ error: {} }),
+    event({ error: { code: 200, message: "Invalid success code" } }),
+    event({ error: { code: "503", message: "Invalid code type" } }),
+    event({ error: { code: 503, message: 42 } }),
+    "event: error\n" + event({ candidates: [] }),
+    "event: error\n" + event(null),
+    "event: error\n" + event([]),
+    "event: error\n\n",
+    "event: error\ndata: [DONE]\n\n",
+    'event: error\ndata: {"error":broken}\n\n',
+  ]
+  for (const raw of malformed) {
+    for (const partial of ["", event({ candidates: [{ content: { parts: [{ text: "partial" }] } }] })]) {
+      await assert.rejects(adaptResponse(sseResponse(partial + raw), false), (error) => error instanceof TypeError || error instanceof SyntaxError)
+    }
+  }
+})
+
+test("passes streamed error events through byte for byte without choosing a new status", async () => {
+  const raw = event({ candidates: [{ content: { parts: [{ text: "partial" }] } }] }) + "event: error\n" + event({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Quota exceeded" } })
+  const upstream = sseResponse(raw, [1])
+  const result = await adaptResponse(upstream, true)
+  assert.equal(result, upstream)
+  assert.equal(result.status, 200)
+  assert.equal(await result.text(), raw)
+})
+
+test("cancels a nonstream upstream body for an already aborted caller", async () => {
+  const abort = new AbortController()
+  const reason = new DOMException("Aborted before aggregation", "AbortError")
+  abort.abort(reason)
+  let cancellationReason
+  const upstream = new Response(new ReadableStream({
+    cancel(value) { cancellationReason = value },
+  }), { headers: { "content-type": "text/event-stream" } })
+  await assert.rejects(adaptResponse(upstream, false, { signal: abort.signal }), (error) => error === reason)
+  assert.equal(cancellationReason, reason)
+})
+
+test("cancels upstream when an event cannot be parsed instead of returning partial content", async () => {
+  let canceled = false
+  const upstream = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(event({ candidates: [{ content: { parts: [{ text: "partial" }] } }] }) + 'data: {"error":broken}\n\n'))
+    },
+    cancel() { canceled = true },
+  }), { headers: { "content-type": "text/event-stream" } })
+  await assert.rejects(adaptResponse(upstream, false), SyntaxError)
+  assert.equal(canceled, true)
+})
+
+test("cancels upstream after a completed signed response without altering the signature", async () => {
+  const signedPart = { functionCall: { id: "lookup:final", name: "lookup", args: { query: "東京" } }, thoughtSignature: "c2lnbmVkLXRvb2wtY2FsbA==" }
+  let canceled = false
+  const upstream = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(event({ candidates: [{ index: 0, content: { role: "model", parts: [signedPart] }, finishReason: "STOP" }], usageMetadata: { totalTokenCount: 12 } }) + "data: [DONE]\n\n"))
+    },
+    cancel() { canceled = true },
+  }), { headers: { "content-type": "text/event-stream" } })
+  const result = await adaptResponse(upstream, false)
+  assert.equal(result.status, 200)
+  assert.deepEqual(await result.json(), {
+    candidates: [{ index: 0, content: { role: "model", parts: [signedPart] }, finishReason: "STOP" }],
+    usageMetadata: { totalTokenCount: 12 },
+  })
+  assert.equal(canceled, true)
 })

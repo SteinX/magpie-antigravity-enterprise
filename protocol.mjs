@@ -31,6 +31,28 @@ export function enterpriseURL(target, action = "streamGenerateContent", stream =
   return `https://${host}/v1beta/projects/${encodeURIComponent(projectId)}/locations/${location}:${action}${stream ? "?alt=sse" : ""}`
 }
 
+// Native Google Schema is an OpenAPI subset, not arbitrary JSON Schema:
+// https://googleapis.github.io/js-genai/release_docs/interfaces/types.Schema.html
+const NATIVE_SCHEMA_FIELDS = new Set([
+  "type", "format", "title", "description", "nullable", "default", "items",
+  "minItems", "maxItems", "enum", "properties", "propertyOrdering", "required",
+  "minProperties", "maxProperties", "minimum", "maximum", "minLength",
+  "maxLength", "pattern", "example", "anyOf",
+])
+
+function needsJsonSchema(schema) {
+  if (!isObject(schema)) return typeof schema === "boolean"
+  for (const [key, value] of Object.entries(schema)) {
+    if (!NATIVE_SCHEMA_FIELDS.has(key)) return true
+    if (key === "type" && Array.isArray(value)) return true
+    if (key === "enum" && Array.isArray(value) && value.some((entry) => typeof entry !== "string")) return true
+    if (key === "items" && (Array.isArray(value) || needsJsonSchema(value))) return true
+    if (key === "properties" && isObject(value) && Object.values(value).some(needsJsonSchema)) return true
+    if (key === "anyOf" && Array.isArray(value) && value.some(needsJsonSchema)) return true
+  }
+  return false
+}
+
 function normalizeTools(tools) {
   if (!Array.isArray(tools)) return tools
   return tools.map((tool) => {
@@ -38,9 +60,16 @@ function normalizeTools(tools) {
     return {
       ...tool,
       functionDeclarations: tool.functionDeclarations.map((declaration) => {
-        if (!isObject(declaration) || !Object.hasOwn(declaration, "parametersJsonSchema")) return declaration
-        const { parametersJsonSchema, ...rest } = declaration
-        return { ...rest, parameters: parametersJsonSchema }
+        if (!isObject(declaration)) return declaration
+        if (Object.hasOwn(declaration, "parametersJsonSchema")) {
+          const { parameters, ...rest } = declaration
+          return rest
+        }
+        if (Object.hasOwn(declaration, "parameters") && needsJsonSchema(declaration.parameters)) {
+          const { parameters, ...rest } = declaration
+          return { ...rest, parametersJsonSchema: parameters }
+        }
+        return declaration
       }),
     }
   })
@@ -165,25 +194,49 @@ function responseAccumulator() {
   }
 }
 
+const ERROR_HTTP_STATUS = new Map([
+  ["CANCELLED", 499], ["UNKNOWN", 500], ["INVALID_ARGUMENT", 400],
+  ["DEADLINE_EXCEEDED", 504], ["NOT_FOUND", 404], ["ALREADY_EXISTS", 409],
+  ["PERMISSION_DENIED", 403], ["UNAUTHENTICATED", 401], ["RESOURCE_EXHAUSTED", 429],
+  ["FAILED_PRECONDITION", 400], ["ABORTED", 409], ["OUT_OF_RANGE", 400],
+  ["UNIMPLEMENTED", 501], ["INTERNAL", 500], ["UNAVAILABLE", 503], ["DATA_LOSS", 500],
+])
+
+function streamError(error) {
+  if (!isObject(error) || typeof error.message !== "string" ||
+      (Object.hasOwn(error, "code") && (!Number.isInteger(error.code) || error.code < 400 || error.code > 599)) ||
+      (Object.hasOwn(error, "status") && typeof error.status !== "string")) {
+    throw new TypeError("The enterprise SSE error event must contain a Google error object.")
+  }
+  return { status: error.code ?? ERROR_HTTP_STATUS.get(error.status) ?? 502, body: { error } }
+}
+
 function sseParser(onEvent) {
   let buffer = ""
   let data = []
+  let eventType = ""
   let done = false
   const dispatch = () => {
-    if (!data.length) return
+    const type = eventType
+    eventType = ""
+    if (!data.length) {
+      if (type === "error") throw new TypeError("The enterprise SSE error event is missing its payload.")
+      return
+    }
     const payload = data.join("\n")
     data = []
-    if (payload.trim() === "[DONE]") done = true
-    else onEvent(JSON.parse(payload))
+    if (type !== "error" && payload.trim() === "[DONE]") done = true
+    else done = onEvent(JSON.parse(payload), type) === true
   }
   const line = (value) => {
     if (value === "") return dispatch()
     const colon = value.indexOf(":")
     const field = colon < 0 ? value : value.slice(0, colon)
-    if (field !== "data") return
+    if (field !== "data" && field !== "event") return
     let valuePart = colon < 0 ? "" : value.slice(colon + 1)
     if (valuePart.startsWith(" ")) valuePart = valuePart.slice(1)
-    data.push(valuePart)
+    if (field === "event") eventType = valuePart
+    else data.push(valuePart)
   }
   return {
     push(text, final = false) {
@@ -208,47 +261,50 @@ function sseParser(onEvent) {
   }
 }
 
-export function adaptResponse(response, wantsStream) {
+export async function adaptResponse(response, wantsStream, { signal } = {}) {
   if (!response.ok || wantsStream || !response.body || !/^\s*text\/event-stream(?:\s*;|$)/i.test(response.headers.get("content-type") ?? "")) return response
 
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   const accumulator = responseAccumulator()
-  const parser = sseParser((chunk) => accumulator.add(chunk))
-  let canceled = false
-  const body = new ReadableStream({
-    async pull(controller) {
-      try {
-        while (!canceled) {
-          const { value, done } = await reader.read()
-          if (canceled) return
-          const terminal = parser.push(done ? decoder.decode() : decoder.decode(value, { stream: true }), done)
-          if (terminal) await reader.cancel()
-          if (canceled) return
-          if (done || terminal) {
-            controller.enqueue(new TextEncoder().encode(JSON.stringify(accumulator.value())))
-            controller.close()
-            return
-          }
-        }
-      } catch (error) {
-        if (!canceled) {
-          controller.error(error)
-          try { await reader.cancel(error) } catch {}
-        }
-      } finally {
-        reader.releaseLock()
-      }
-    },
-    async cancel(reason) {
-      canceled = true
-      try { await reader.cancel(reason) } finally { reader.releaseLock() }
-    },
+  let failure
+  const parser = sseParser((chunk, type) => {
+    if (type === "error" || (isObject(chunk) && Object.hasOwn(chunk, "error"))) {
+      failure = streamError(isObject(chunk) && Object.hasOwn(chunk, "error") ? chunk.error : chunk)
+      return true
+    }
+    accumulator.add(chunk)
+    return false
   })
-  const headers = new Headers(response.headers)
-  headers.set("content-type", "application/json")
-  headers.delete("content-length")
-  headers.delete("content-encoding")
-  headers.delete("transfer-encoding")
-  return new Response(body, { status: response.status, statusText: response.statusText, headers })
+  let cancellation
+  const cancel = (reason) => cancellation ??= reader.cancel(reason).catch(() => {})
+  const onAbort = () => { void cancel(signal.reason) }
+  signal?.addEventListener("abort", onAbort, { once: true })
+  try {
+    signal?.throwIfAborted()
+    while (true) {
+      const { value, done } = await reader.read()
+      signal?.throwIfAborted()
+      const terminal = parser.push(done ? decoder.decode() : decoder.decode(value, { stream: true }), done)
+      if (terminal) await cancel()
+      if (done || terminal) break
+    }
+    signal?.throwIfAborted()
+    const headers = new Headers(response.headers)
+    headers.set("content-type", "application/json")
+    headers.delete("content-length")
+    headers.delete("content-encoding")
+    headers.delete("transfer-encoding")
+    return new Response(JSON.stringify(failure ? failure.body : accumulator.value()), {
+      status: failure ? failure.status : response.status,
+      statusText: failure ? undefined : response.statusText,
+      headers,
+    })
+  } catch (error) {
+    await cancel(error)
+    throw error
+  } finally {
+    signal?.removeEventListener("abort", onAbort)
+    reader.releaseLock()
+  }
 }

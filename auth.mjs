@@ -57,6 +57,18 @@ function run(file, args, { signal, input, timeout = 30_000 } = {}) {
   });
 }
 
+function effectiveRefreshMethod(profile) {
+  if (!['gcp', 'wif', 'business_licensed_enterprise'].includes(profile.auth_method)) {
+    throw failure('ERR_NATIVE_METHOD', 'The native account is not a supported enterprise account.');
+  }
+  // Native getOAuthConfig gives a nonempty provider precedence over the stored label.
+  if (profile.wif_provider) return 'wif';
+  if (profile.auth_method === 'wif') {
+    throw failure('ERR_NATIVE_METHOD', 'The native workforce account has no identity provider.');
+  }
+  return 'gcp';
+}
+
 function decode(raw) {
   try {
     const text = raw.trim();
@@ -76,12 +88,7 @@ function decode(raw) {
     for (const field of ['auth_method', 'wif_provider', 'project_id', 'region', 'user_tier', 'tier_display_name']) {
       if (typeof profile[field] !== 'string') throw new Error();
     }
-    if (!['gcp', 'wif', 'business_licensed_enterprise'].includes(profile.auth_method)) {
-      throw failure('ERR_NATIVE_METHOD', 'The native account is not a supported enterprise account.');
-    }
-    if (profile.auth_method === 'wif' && !profile.wif_provider) {
-      throw failure('ERR_NATIVE_METHOD', 'The native workforce account has no identity provider.');
-    }
+    effectiveRefreshMethod(profile);
     return { raw: text, profile };
   } catch (error) {
     if (error instanceof NativeAuthError) throw error;
@@ -91,7 +98,7 @@ function decode(raw) {
 
 function validateConfig(profile, config) {
   if (!config) return;
-  if (config.authMethod && config.authMethod !== 'auto' && config.authMethod !== profile.auth_method) {
+  if (config.authMethod && config.authMethod !== 'auto' && config.authMethod !== effectiveRefreshMethod(profile)) {
     throw failure('ERR_NATIVE_ACCOUNT_CHANGED', 'The configured authentication method differs from the native account; reconnect explicitly.');
   }
   if (config.wifProvider && config.wifProvider !== profile.wif_provider) {
@@ -158,8 +165,7 @@ async function installedClientConfig(appPath, profile) {
     pending.catch(() => clientCache.delete(key));
   }
   const native = await pending;
-  // The native getOAuthConfig contract gives nonempty WIF provider precedence.
-  if (profile.wif_provider) {
+  if (effectiveRefreshMethod(profile) === 'wif') {
     if (!native.wifClient) throw failure('ERR_NATIVE_CLIENT', 'The installed app does not contain the expected workforce OAuth client.');
     return { url: 'https://sts.googleapis.com/v1/oauthtoken', clientId: WIF_CLIENT };
   }
