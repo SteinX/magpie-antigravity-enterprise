@@ -1,15 +1,15 @@
 {
-  "name": "opencode-antigravity-enterprise",
+  "name": "magpie-antigravity-enterprise",
   "version": "1.0.0",
   "private": true,
   "description": "Antigravity enterprise seats through the local Antigravity sign-in",
-  "repository": { "type": "git", "url": "https://github.com/SteinX/opencode-antigravity-enterprise.git" },
-  "homepage": "https://github.com/SteinX/opencode-antigravity-enterprise#readme",
+  "repository": { "type": "git", "url": "https://github.com/SteinX/magpie-antigravity-enterprise.git" },
+  "homepage": "https://github.com/SteinX/magpie-antigravity-enterprise#readme",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
   "files": ["index.mjs", "auth.mjs", "protocol.mjs", "keychain-helper.swift", "README.md"],
   "scripts": { "test": "node --test *.test.mjs" },
-  "keywords": ["opencode-plugin", "magpie", "antigravity", "enterprise"],
+  "keywords": ["magpie", "magpie-plugin", "antigravity", "enterprise"],
   "magpie": { "name": "Antigravity Enterprise", "maxConcurrency": 4 }
 }

@@ -4,7 +4,7 @@ A local Magpie provider for the enterprise account already signed in to Antigrav
 
 ## Requirements
 
-- Magpie with OpenCode provider-plugin support.
+- Magpie with provider-plugin support.
 - Antigravity App installed and signed in to a Google Cloud or Workforce Identity Federation enterprise account.
 - macOS login Keychain access. The plugin uses Antigravity's existing `gemini / antigravity` item.
 - Xcode Command Line Tools (`xcrun swiftc`) for the first credential renewal. A small Security-framework helper is compiled once and cached; credentials are supplied through stdin, never compiler arguments or source files.
@@ -14,8 +14,8 @@ A local Magpie provider for the enterprise account already signed in to Antigrav
 Clone the repository, then register its local folder with Magpie:
 
 ```sh
-gh repo clone SteinX/opencode-antigravity-enterprise
-cd opencode-antigravity-enterprise
+gh repo clone SteinX/magpie-antigravity-enterprise
+cd magpie-antigravity-enterprise
 magpie plugin add .
 magpie plugin login antigravity-enterprise
 ```
