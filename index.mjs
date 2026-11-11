@@ -19,6 +19,12 @@ function requestSignal(signal) {
   return signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000)
 }
 
+function boundedMap(map, key, value) {
+  map.set(key, value)
+  if (map.size > 256) map.delete(map.keys().next().value)
+  return value
+}
+
 async function readJSON(response, operation) {
   const result = await response.json().catch(() => null)
   if (!response.ok) {
@@ -56,7 +62,7 @@ export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => 
   const createSession = options._deps?.createNativeSession ?? createNativeSession
   let native = createSession(options)
   const trajectories = new Map()
-  let sequence = 0
+  const trajectoryCounters = new Map()
 
   async function headersFor(profile, signal) {
     signal?.throwIfAborted()
@@ -89,17 +95,18 @@ export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => 
   }
 
   function trajectory(body, metadata, incomingHeaders) {
-    const firstUser = body.contents?.find((content) => content.role === "user")
-    const session = new Headers(incomingHeaders).get("x-aicode-trajectory-id")
-    if (session && /^[a-zA-Z0-9_-]{1,128}$/.test(session)) return session
-    const key = createHash("sha256").update(JSON.stringify([metadata.nativeBinding, metadata.projectId, metadata.location, body.systemInstruction ?? body.system_instruction, firstUser])).digest("hex")
-    let id = trajectories.get(key)
-    if (!id) {
-      id = randomUUID()
-      trajectories.set(key, id)
-      if (trajectories.size > 256) trajectories.delete(trajectories.keys().next().value)
+    const scope = [metadata.nativeBinding, metadata.projectId, metadata.location]
+    let id = new Headers(incomingHeaders).get("x-aicode-trajectory-id")
+    if (!id || !/^[a-zA-Z0-9_-]{1,128}$/.test(id)) {
+      const firstUser = body.contents?.find((content) => content.role === "user")
+      const key = createHash("sha256").update(JSON.stringify([...scope, body.systemInstruction ?? body.system_instruction, firstUser])).digest("hex")
+      id = trajectories.get(key) ?? boundedMap(trajectories, key, randomUUID())
     }
-    return id
+    const key = JSON.stringify([...scope, id])
+    const counter = trajectoryCounters.get(key) ?? boundedMap(trajectoryCounters, key, { id, next: 0 })
+    const priorGenerations = body.contents?.reduce((count, content) => count + (content.role === "model" && content.parts?.some((part) => !Object.hasOwn(part, "functionResponse")) ? 1 : 0), 0) ?? 0
+    counter.next = Math.max(counter.next, priorGenerations)
+    return counter
   }
 
   const prompts = [
@@ -173,12 +180,12 @@ export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => 
               const auth = await getAuth()
               let state = await signedIn(auth, signal)
               const payload = buildPayload(body, model, state.metadata.userTier)
-              const id = trajectory(body, state.metadata, request.headers)
+              const currentTrajectory = trajectory(body, state.metadata, request.headers)
               const send = async () => {
                 const headers = await headersFor(state.profile, signal)
-                headers.Accept = "text/event-stream"
-                headers["X-Aicode-Trajectory-Id"] = id
-                headers["X-Aicode-Request-Id"] = `${id}-${sequence++}`
+                headers["Accept-Encoding"] = "gzip"
+                headers["X-Aicode-Trajectory-Id"] = currentTrajectory.id
+                headers["X-Aicode-Request-Id"] = `${currentTrajectory.id}-${currentTrajectory.next++}`
                 return fetch(enterpriseURL(state.target), { method: "POST", headers, body: JSON.stringify(payload), signal })
               }
               let response = await send()

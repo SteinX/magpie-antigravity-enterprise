@@ -167,12 +167,12 @@ async function installedClientConfig(appPath, profile) {
   const native = await pending;
   if (effectiveRefreshMethod(profile) === 'wif') {
     if (!native.wifClient) throw failure('ERR_NATIVE_CLIENT', 'The installed app does not contain the expected workforce OAuth client.');
-    return { url: 'https://sts.googleapis.com/v1/oauthtoken', clientId: WIF_CLIENT };
+    return { url: 'https://sts.googleapis.com/v1/oauthtoken', clientId: WIF_CLIENT, clientSecret: '', authStyle: 'basic' };
   }
   if (!native.cloudClient || !native.cloudSecret) {
     throw failure('ERR_NATIVE_CLIENT', 'The installed app does not contain the supported enterprise OAuth configuration.');
   }
-  return { url: 'https://oauth2.googleapis.com/token', clientId: CLOUD_CLIENT, clientSecret: native.cloudSecret };
+  return { url: 'https://oauth2.googleapis.com/token', clientId: CLOUD_CLIENT, clientSecret: native.cloudSecret, authStyle: 'form' };
 }
 
 async function helperExecutable(stateDir) {
@@ -403,12 +403,20 @@ export function createNativeSession(options = {}) {
         const client = await deps.oauthConfig(current.profile);
         checkAbort(own.controller.signal);
         const form = new URLSearchParams();
-        form.set('client_id', client.clientId);
-        if (client.clientSecret) form.set('client_secret', client.clientSecret);
+        const headers = { 'content-type': 'application/x-www-form-urlencoded' };
+        if (client.authStyle === 'basic') {
+          // Captured native WIF refresh uses Basic with an empty client secret.
+          headers.authorization = `Basic ${Buffer.from(`${client.clientId}:${client.clientSecret}`).toString('base64')}`;
+          headers['user-agent'] = 'Go-http-client/2.0';
+          headers['accept-encoding'] = 'gzip';
+        } else {
+          form.set('client_id', client.clientId);
+          if (client.clientSecret) form.set('client_secret', client.clientSecret);
+        }
         form.set('grant_type', 'refresh_token');
         form.set('refresh_token', current.profile.token.refresh_token);
         const response = await deps.fetch(client.url, {
-          method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form,
+          method: 'POST', headers, body: form,
           signal: AbortSignal.any([own.controller.signal, AbortSignal.timeout(30_000)]), redirect: 'error',
         });
         if (!response.ok) {

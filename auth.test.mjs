@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { inspect } from 'node:util';
 import { createNativeSession } from './auth.mjs';
 
 const NOW = Date.parse('2026-11-11T12:00:00Z');
@@ -28,7 +30,7 @@ function fixture(initial = native(), options = {}) {
   let raw = encode(initial);
   let queue = Promise.resolve();
   const principalMap = new Map();
-  const calls = { reads: 0, commits: 0, oauthConfigs: 0, renewals: 0, userinfo: 0, urls: [], forms: [], signals: [] };
+  const calls = { reads: 0, commits: 0, oauthConfigs: 0, renewals: 0, userinfo: 0, urls: [], forms: [], headers: [], signals: [] };
   const deps = {
     now: () => NOW,
     metadata: async () => ({ version: '2.31.0', cl: '1017595969', platform: 'darwin', arch: 'arm64' }),
@@ -58,8 +60,8 @@ function fixture(initial = native(), options = {}) {
     oauthConfig: async value => {
       calls.oauthConfigs++;
       return value.wif_provider
-        ? { url: 'https://sts.googleapis.com/v1/oauthtoken', clientId: 'test-workforce-client' }
-        : { url: 'https://oauth2.googleapis.com/token', clientId: 'test-cloud-client', clientSecret: 'test-public-client-config' };
+        ? { url: 'https://sts.googleapis.com/v1/oauthtoken', clientId: 'test-workforce-client', clientSecret: '', authStyle: 'basic' }
+        : { url: 'https://oauth2.googleapis.com/token', clientId: 'test-cloud-client', clientSecret: 'test-public-client-config', authStyle: 'form' };
     },
     fetch: async (url, request) => {
       if (url.endsWith('/userinfo')) {
@@ -69,6 +71,7 @@ function fixture(initial = native(), options = {}) {
       calls.renewals++;
       calls.urls.push(url);
       calls.forms.push(Object.fromEntries(request.body));
+      calls.headers.push(Object.fromEntries(new Headers(request.headers)));
       calls.signals.push(request.signal);
       return options.refresh ? options.refresh(url, request) : json({ access_token: `renewed-access-${calls.renewals}`, expires_in: 3600 });
     },
@@ -141,8 +144,12 @@ test('selects the effective refresh mechanism across native labels and explicit 
           assert.equal(f.calls.renewals, 1);
           assert.equal(f.calls.commits, 1);
           assert.deepEqual(f.calls.urls, [effective === 'wif' ? 'https://sts.googleapis.com/v1/oauthtoken' : 'https://oauth2.googleapis.com/token']);
-          assert.equal(f.calls.forms[0].client_id, effective === 'wif' ? 'test-workforce-client' : 'test-cloud-client');
-          assert.equal('client_secret' in f.calls.forms[0], effective === 'gcp');
+          assert.deepEqual(f.calls.forms[0], effective === 'wif'
+            ? { grant_type: 'refresh_token', refresh_token: 'test-refresh' }
+            : { client_id: 'test-cloud-client', client_secret: 'test-public-client-config', grant_type: 'refresh_token', refresh_token: 'test-refresh' });
+          assert.deepEqual(f.calls.headers[0], effective === 'wif'
+            ? { 'content-type': 'application/x-www-form-urlencoded', authorization: 'Basic dGVzdC13b3JrZm9yY2UtY2xpZW50Og==', 'user-agent': 'Go-http-client/2.0', 'accept-encoding': 'gzip' }
+            : { 'content-type': 'application/x-www-form-urlencoded' });
           for (const value of [result, f.value]) {
             assert.equal(value.auth_method, auth_method);
             assert.equal(value.wif_provider, wif_provider);
@@ -304,8 +311,8 @@ test('opaque workforce lineage survives our rotations and a new session', async 
   assert.equal(f.session.binding(first), f.session.binding(second));
   assert.equal(f.session.binding(first), f.session.binding(nextHost));
   assert.equal(f.calls.renewals, 2);
-  assert.equal(f.calls.forms[0].client_id, 'test-workforce-client');
-  assert.equal('client_secret' in f.calls.forms[0], false);
+  assert.deepEqual(f.calls.forms[0], { grant_type: 'refresh_token', refresh_token: 'test-refresh' });
+  assert.equal(f.calls.headers[0].authorization, 'Basic dGVzdC13b3JrZm9yY2UtY2xpZW50Og==');
   for (const [key, value] of f.principalMap) {
     assert.match(key, /^[a-f0-9]{64}$/);
     assert.match(value, /^[a-f0-9]{64}$/);
@@ -337,22 +344,115 @@ test('a failed renewal neither overwrites native credentials nor exposes its bod
   assert.equal(f.calls.commits, 0);
 });
 
-test('uses installed WIF client evidence for every supported native label', async t => {
+test('never attaches or logs WIF request credentials from renewal failures', async t => {
+  const logged = [];
+  for (const method of ['debug', 'error', 'info', 'log', 'trace', 'warn']) {
+    t.mock.method(console, method, (...args) => logged.push(args));
+  }
+  const refreshToken = 'synthetic-private-refresh-credential';
+  const authorization = 'Basic dGVzdC13b3JrZm9yY2UtY2xpZW50Og==';
+  for (const transportFailure of [false, true]) {
+    await t.test(transportFailure ? 'transport error with attached request' : 'rejected endpoint response', async () => {
+      const f = fixture(native({ wif_provider: 'native-workforce-provider', token: { ...native().token, refresh_token: refreshToken } }), {
+        refresh: (_url, request) => {
+          const privateDetails = `${authorization} ${request.body}`;
+          if (transportFailure) {
+            throw Object.assign(new Error(privateDetails, { cause: new Error(privateDetails) }), { request, credentials: privateDetails });
+          }
+          return json({ error: 'invalid_client', error_description: privateDetails }, 401);
+        },
+      });
+      const original = f.value;
+      await assert.rejects(f.session.profile({ forceRefresh: true }), error => {
+        assert.equal(error.code, transportFailure ? 'ERR_NATIVE_AUTH' : 'ERR_NATIVE_REFRESH');
+        assert.equal(error.cause, undefined);
+        assert.equal(error.request, undefined);
+        assert.equal(error.credentials, undefined);
+        const details = inspect(error, { depth: null });
+        assert.equal(details.includes(refreshToken), false);
+        assert.equal(details.includes(authorization), false);
+        return true;
+      });
+      assert.equal(f.calls.headers[0].authorization, authorization);
+      assert.equal(f.calls.commits, 0);
+      assert.deepEqual(f.value, original);
+    });
+  }
+  assert.deepEqual(logged, []);
+});
+
+test('matches the captured WIF refresh endpoint contract for every supported native label', async t => {
+  const clientId = 'a2a6f0e3e-3ff0-462b-869a-47277df4c806';
+  const body = 'grant_type=refresh_token&refresh_token=test-refresh';
+  const headers = {
+    'content-type': 'application/x-www-form-urlencoded',
+    authorization: `Basic ${Buffer.from(`${clientId}:`).toString('base64')}`,
+    'user-agent': 'Go-http-client/2.0',
+    'accept-encoding': 'gzip',
+  };
+  // Synthetic loopback endpoint rejects the old form-auth request and incomplete
+  // Basic credentials before returning any renewable native token.
+  const server = createServer(async (request, response) => {
+    let receivedBody = '';
+    for await (const chunk of request) receivedBody += chunk;
+    const receivedAuthorization = request.headers.authorization;
+    const authenticated = typeof receivedAuthorization === 'string' && receivedAuthorization.startsWith('Basic ')
+      && Buffer.from(receivedAuthorization.slice(6), 'base64').toString('utf8') === 'a2a6f0e3e-3ff0-462b-869a-47277df4c806:';
+    const status = !authenticated ? 401
+      : request.method !== 'POST' || request.url !== '/v1/oauthtoken' || receivedBody !== body
+        || request.headers['content-type'] !== 'application/x-www-form-urlencoded'
+        || request.headers['user-agent'] !== 'Go-http-client/2.0' || request.headers['accept-encoding'] !== 'gzip' ? 400 : 200;
+    response.writeHead(status, { 'content-type': 'application/json' });
+    response.end(JSON.stringify(status === 200
+      ? { access_token: 'contract-renewed-access', expires_in: 3600 }
+      : { error: status === 401 ? 'invalid_client' : 'invalid_request' }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+  const endpoint = `http://127.0.0.1:${server.address().port}/v1/oauthtoken`;
+  for (const invalid of [
+    { name: 'form client_id', body: `${body}&client_id=${clientId}`, status: 400 },
+    { name: 'form client_secret', body: `${body}&client_secret=`, status: 400 },
+    { name: 'missing Basic', authorization: undefined, status: 401 },
+    { name: 'wrong Basic client', authorization: `Basic ${Buffer.from('other-client:').toString('base64')}`, status: 401 },
+    { name: 'nonempty Basic secret', authorization: `Basic ${Buffer.from(`${clientId}:unexpected-secret`).toString('base64')}`, status: 401 },
+    { name: 'wrong authorization scheme', authorization: 'Bearer synthetic-token', status: 401 },
+    { name: 'wrong user-agent', headers: { 'user-agent': 'synthetic-client' }, status: 400 },
+    { name: 'wrong accept-encoding', headers: { 'accept-encoding': 'identity' }, status: 400 },
+  ]) {
+    await t.test(`rejects ${invalid.name}`, async () => {
+      const requestHeaders = { ...headers, ...invalid.headers };
+      if ('authorization' in invalid) {
+        if (invalid.authorization === undefined) delete requestHeaders.authorization;
+        else requestHeaders.authorization = invalid.authorization;
+      }
+      const response = await fetch(endpoint, { method: 'POST', headers: requestHeaders, body: invalid.body ?? body });
+      assert.equal(response.status, invalid.status);
+      assert.equal((await response.json()).error, invalid.status === 401 ? 'invalid_client' : 'invalid_request');
+    });
+  }
   const directory = await mkdtemp(join(tmpdir(), 'antigravity-client-fixture-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const bin = join(directory, 'Contents/Resources/bin');
   await mkdir(bin, { recursive: true });
-  await writeFile(join(bin, 'language_server'), 'native binary fixture a2a6f0e3e-3ff0-462b-869a-47277df4c806');
+  await writeFile(join(bin, 'language_server'), `native binary fixture ${clientId}`);
   for (const auth_method of ['gcp', 'wif', 'business_licensed_enterprise']) {
     for (const authMethod of ['auto', 'wif']) {
       await t.test(`${auth_method}, choice ${authMethod}`, async () => {
-        const f = fixture(native({ auth_method, wif_provider: 'native-workforce-provider' }));
+        const f = fixture(native({ auth_method, wif_provider: 'native-workforce-provider' }), {
+          refresh: (_url, request) => fetch(endpoint, request),
+        });
         const { oauthConfig: _unused, ...dependencies } = f.deps;
         const session = createNativeSession({ ...f.sessionOptions, appPath: directory, _deps: dependencies });
         const result = await session.profile({ forceRefresh: true, config: { authMethod, wifProvider: '' } });
         assert.deepEqual(f.calls.urls, ['https://sts.googleapis.com/v1/oauthtoken']);
-        assert.equal(f.calls.forms[0].client_id, 'a2a6f0e3e-3ff0-462b-869a-47277df4c806');
-        assert.equal('client_secret' in f.calls.forms[0], false);
+        assert.deepEqual(f.calls.forms[0], { grant_type: 'refresh_token', refresh_token: 'test-refresh' });
+        assert.deepEqual(f.calls.headers[0], headers);
+        assert.equal(f.calls.commits, 1);
+        assert.equal(result.token.access_token, 'contract-renewed-access');
         assert.equal(result.auth_method, auth_method);
       });
     }

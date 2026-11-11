@@ -36,7 +36,7 @@ async function fixture(t, responses = [sse()], { binding = "native-account" } = 
   })
   const plugin = await AntigravityEnterprisePlugin({}, { _deps: { createNativeSession: () => native } })
   const client = await plugin.auth.loader(async () => ({ type: "api", metadata }))
-  return { fetch: client.fetch, requests, profiles, metadata }
+  return { fetch: client.fetch, requests, profiles, metadata, native }
 }
 
 async function assertAnswer(response) {
@@ -51,7 +51,7 @@ test("fetch(Request) reads its URL, JSON body, headers, and bound native account
   const f = await fixture(t)
   const request = new Request(endpoint, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-aicode-trajectory-id": "request-session" },
+    headers: { "content-type": "application/json", "x-aicode-trajectory-id": "request-session", accept: "text/event-stream" },
     body: JSON.stringify(inputBody),
   })
   await assertAnswer(await f.fetch(request))
@@ -65,7 +65,9 @@ test("fetch(Request) reads its URL, JSON body, headers, and bound native account
   assert.equal(sent.headers.get("authorization"), "Bearer native-access")
   assert.equal(sent.headers.get("user-agent"), "antigravity/native-test-client")
   assert.equal(sent.headers.get("content-type"), "application/json")
-  assert.equal(sent.headers.get("accept"), "text/event-stream")
+  assert.equal(sent.headers.get("accept"), null)
+  assert.equal(sent.headers.get("accept-encoding"), "gzip")
+  assert.equal(sent.headers.get("x-aicode-request-id"), "request-session-0")
   assert.equal(f.profiles[0].config, f.metadata)
   assert.equal(f.profiles[0].signal, sent.signal)
 })
@@ -191,7 +193,7 @@ test("passes the inherited signal through to nonstream response aggregation", { 
 
 test("renews an upstream 401 once and reuses the bound trajectory and payload", async (t) => {
   const rejected = json({ error: { message: "Expired access token" } }, 401)
-  const f = await fixture(t, [rejected, sse()])
+  const f = await fixture(t, [rejected, sse(), sse(), sse()])
   await assertAnswer(await f.fetch(endpoint, {
     method: "POST", headers: { "x-aicode-trajectory-id": "retry-session" }, body: JSON.stringify(inputBody),
   }))
@@ -202,6 +204,13 @@ test("renews an upstream 401 once and reuses the bound trajectory and payload", 
   assert.deepEqual(f.requests.map((request) => request.headers.get("authorization")), ["Bearer native-access", "Bearer renewed-access"])
   assert.deepEqual(f.requests.map((request) => request.headers.get("x-aicode-trajectory-id")), ["retry-session", "retry-session"])
   assert.deepEqual(f.requests.map((request) => request.headers.get("x-aicode-request-id")), ["retry-session-0", "retry-session-1"])
+  await assertAnswer(await f.fetch(endpoint, {
+    method: "POST", headers: { "x-aicode-trajectory-id": "independent-session" }, body: JSON.stringify(inputBody),
+  }))
+  await assertAnswer(await f.fetch(endpoint, {
+    method: "POST", headers: { "x-aicode-trajectory-id": "retry-session" }, body: JSON.stringify(inputBody),
+  }))
+  assert.deepEqual(f.requests.map((request) => request.headers.get("x-aicode-request-id")), ["retry-session-0", "retry-session-1", "independent-session-0", "retry-session-2"])
 })
 
 test("a second upstream 401 is returned without a third inference attempt", async (t) => {
@@ -238,4 +247,148 @@ test("a changed native account remains an authentication failure before inferenc
   assert.equal(response.headers.get("x-magpie-sign-in"), "expired")
   assert.match((await response.json()).error.message, /account signed in to Antigravity changed/)
   assert.equal(f.requests.length, 0)
+})
+
+test("provided trajectories number interleaved conversations independently", async (t) => {
+  const f = await fixture(t, [sse(), sse(), sse()])
+  for (const id of ["conversation-a", "conversation-b", "conversation-a"]) {
+    await assertAnswer(await f.fetch(endpoint, {
+      method: "POST", headers: { "x-aicode-trajectory-id": id }, body: JSON.stringify(inputBody),
+    }))
+  }
+  assert.deepEqual(f.requests.map((request) => request.headers.get("x-aicode-request-id")), ["conversation-a-0", "conversation-b-0", "conversation-a-1"])
+})
+
+test("generated trajectories number interleaved conversations independently", async (t) => {
+  const f = await fixture(t, [sse(), sse(), sse()])
+  for (const text of ["Conversation A", "Conversation B", "Conversation A"]) {
+    await assertAnswer(await f.fetch(endpoint, {
+      method: "POST", body: JSON.stringify({ contents: [{ role: "user", parts: [{ text }] }] }),
+    }))
+  }
+  const ids = f.requests.map((request) => request.headers.get("x-aicode-trajectory-id"))
+  assert.match(ids[0], /^[0-9a-f]{8}-[0-9a-f-]{27}$/)
+  assert.match(ids[1], /^[0-9a-f]{8}-[0-9a-f-]{27}$/)
+  assert.notEqual(ids[0], ids[1])
+  assert.equal(ids[2], ids[0])
+  assert.deepEqual(f.requests.map((request) => request.headers.get("x-aicode-request-id")), [`${ids[0]}-0`, `${ids[1]}-0`, `${ids[0]}-1`])
+})
+
+test("a generated trajectory keeps its counter when supplied explicitly", async (t) => {
+  const f = await fixture(t, [sse(), sse(), sse()])
+  await assertAnswer(await f.fetch(endpoint, { method: "POST", body: JSON.stringify(inputBody) }))
+  const id = f.requests[0].headers.get("x-aicode-trajectory-id")
+  await assertAnswer(await f.fetch(endpoint, {
+    method: "POST", headers: { "x-aicode-trajectory-id": id }, body: JSON.stringify(inputBody),
+  }))
+  await assertAnswer(await f.fetch(endpoint, { method: "POST", body: JSON.stringify(inputBody) }))
+  assert.deepEqual(f.requests.map((request) => request.headers.get("x-aicode-request-id")), [`${id}-0`, `${id}-1`, `${id}-2`])
+})
+
+for (const supplied of [false, true]) {
+  test(`${supplied ? "provided" : "generated"} trajectory counters isolate account, project, and location`, async (t) => {
+    const f = await fixture(t, [sse(), sse(), sse(), sse(), sse()])
+    const original = { ...f.metadata }
+    const scopes = [
+      original,
+      { ...original, projectId: "another-licensed-project" },
+      { ...original, location: "us" },
+      { ...original, nativeBinding: "another-native-account" },
+      original,
+    ]
+    for (const scope of scopes) {
+      Object.assign(f.metadata, scope)
+      f.native.binding = () => scope.nativeBinding
+      await assertAnswer(await f.fetch(endpoint, {
+        method: "POST", headers: supplied ? { "x-aicode-trajectory-id": "shared-trajectory" } : {}, body: JSON.stringify(inputBody),
+      }))
+    }
+    const ids = f.requests.map((request) => request.headers.get("x-aicode-trajectory-id"))
+    assert.equal(new Set(ids.slice(0, 4)).size, supplied ? 1 : 4)
+    assert.equal(ids[4], ids[0])
+    assert.deepEqual(f.requests.map((request) => request.headers.get("x-aicode-request-id")), ids.map((id, index) => `${id}-${index === 4 ? 1 : 0}`))
+  })
+
+  test(`${supplied ? "explicit" : "generated"} trajectory resumes from full history without moving its counter backward`, async (t) => {
+    const f = await fixture(t, [sse(), sse(), sse()])
+    const modelTurn = { role: "model", parts: [{ text: "Earlier answer" }] }
+    const history = {
+      contents: [
+        ...inputBody.contents,
+        { role: "model", parts: [{ functionCall: { name: "read_file", args: { path: "example.txt" } } }] },
+        { role: "model", parts: [{ functionResponse: { name: "read_file", response: { content: "File contents" } } }] },
+        modelTurn,
+        { role: "user", parts: [{ text: "Continue this conversation" }] },
+      ],
+    }
+    for (const body of [history, inputBody, { contents: [...history.contents, modelTurn, modelTurn] }]) {
+      await assertAnswer(await f.fetch(endpoint, {
+        method: "POST", headers: supplied ? { "x-aicode-trajectory-id": "resumed-trajectory" } : {}, body: JSON.stringify(body),
+      }))
+    }
+    const id = f.requests[0].headers.get("x-aicode-trajectory-id")
+    if (supplied) assert.equal(id, "resumed-trajectory")
+    assert.deepEqual(f.requests.map((request) => request.headers.get("x-aicode-trajectory-id")), [id, id, id])
+    assert.deepEqual(f.requests.map((request) => request.headers.get("x-aicode-request-id")), [`${id}-2`, `${id}-3`, `${id}-4`])
+  })
+}
+
+test("tool response only model messages do not count as prior generations", async (t) => {
+  const f = await fixture(t, [sse(), sse()])
+  const toolResult = { functionResponse: { name: "read_file", response: { content: "File contents" } } }
+  const history = [
+    ...inputBody.contents,
+    { role: "model", parts: [toolResult] },
+    { role: "model", parts: [toolResult, toolResult] },
+    { role: "model", parts: [] },
+    { role: "user", parts: [toolResult] },
+  ]
+  for (const contents of [history, [...history, { role: "model", parts: [toolResult, { text: "A generated answer" }] }]]) {
+    await assertAnswer(await f.fetch(endpoint, {
+      method: "POST", headers: { "x-aicode-trajectory-id": "tool-results" }, body: JSON.stringify({ contents }),
+    }))
+  }
+  assert.deepEqual(f.requests.map((request) => request.headers.get("x-aicode-request-id")), ["tool-results-0", "tool-results-1"])
+})
+
+test("caller labels and model payload pass through with the actual app identity", async (t) => {
+  const f = await fixture(t)
+  const body = {
+    ...inputBody,
+    systemInstruction: { parts: [{ text: "Use the supplied context" }] },
+    generationConfig: { temperature: 0.3, maxOutputTokens: 123 },
+    labels: { cascade_id: "caller-cascade", root_cascade_id: "caller-root", custom_label: "caller-value" },
+  }
+  await assertAnswer(await f.fetch(endpoint, {
+    method: "POST",
+    headers: { "x-aicode-trajectory-id": "caller-trajectory", "user-agent": "caller-user-agent", accept: "text/event-stream", "accept-encoding": "identity" },
+    body: JSON.stringify(body),
+  }))
+  const sent = f.requests[0]
+  assert.deepEqual(sent.payload, { ...body, aicode: { experience: "gemini-3.8-flash-low" }, entitlement: { userTier: "licensed-tier" } })
+  assert.equal(sent.headers.get("user-agent"), "antigravity/native-test-client")
+  assert.equal(sent.headers.get("accept"), null)
+  assert.equal(sent.headers.get("accept-encoding"), "gzip")
+})
+
+test("native tool turns increment once and newer full history raises the counter lower bound", async (t) => {
+  const f = await fixture(t, [sse(), sse(), sse(), sse()])
+  const toolHistory = [
+    ...inputBody.contents,
+    { role: "model", parts: [{ functionCall: { name: "read_file", args: { path: "example.txt" } } }] },
+    { role: "model", parts: [{ functionResponse: { name: "read_file", response: { content: "File contents" } } }] },
+  ]
+  const resumedHistory = [
+    ...toolHistory,
+    { role: "model", parts: [{ text: "The file contains the requested information" }] },
+    { role: "user", parts: [{ text: "Explain the result" }] },
+    { role: "model", parts: [{ text: "An explanation from another process" }] },
+    { role: "user", parts: [{ text: "Continue" }] },
+  ]
+  for (const contents of [inputBody.contents, toolHistory, resumedHistory, inputBody.contents]) {
+    await assertAnswer(await f.fetch(endpoint, {
+      method: "POST", headers: { "x-aicode-trajectory-id": "tool-conversation" }, body: JSON.stringify({ contents }),
+    }))
+  }
+  assert.deepEqual(f.requests.map((request) => request.headers.get("x-aicode-request-id")), ["tool-conversation-0", "tool-conversation-1", "tool-conversation-3", "tool-conversation-4"])
 })
