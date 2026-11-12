@@ -6,7 +6,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inspect } from 'node:util';
-import { createNativeSession } from './auth.mjs';
+import { createNativeSession, nativeOAuthConfig } from './auth.mjs';
 import { CliMetadataError } from './cli-metadata.mjs';
 import { KeychainError } from './keychain.mjs';
 
@@ -275,6 +275,91 @@ test('refuses another account even when its project and provider match', async (
   await assert.rejects(f.session.profile(), { code: 'ERR_NATIVE_ACCOUNT_CHANGED' });
   const next = await f.freshSession().profile();
   assert.notEqual(f.session.binding(first), f.session.binding(next));
+});
+
+test('a new session rejects a replaced expected credential before identity or OAuth', async t => {
+  for (const forceRefresh of [false, true]) {
+    await t.test(`forceRefresh=${forceRefresh}`, async () => {
+      const expected = native();
+      const replacement = native({ token: { ...expected.token, access_token: 'other-access', refresh_token: 'other-refresh' } });
+      const f = fixture(replacement);
+      let principalReads = 0;
+      const readPrincipal = f.deps.readPrincipal;
+      f.deps.readPrincipal = key => { principalReads++; return readPrincipal(key); };
+      const expectedCredential = encode(expected);
+      await assert.rejects(f.freshSession().profile({ expectedCredential, forceRefresh }), error => {
+        assert.equal(error.code, 'ERR_NATIVE_ACCOUNT_CHANGED');
+        assert.equal(error.signIn, 'expired');
+        assert.equal(error.cause, undefined);
+        const rendered = inspect(error, { depth: null });
+        for (const secret of [expectedCredential, expected.token.access_token, expected.token.refresh_token]) {
+          assert.equal(rendered.includes(secret), false);
+        }
+        return true;
+      });
+      assert.equal(f.calls.reads, 1);
+      assert.equal(principalReads, 0);
+      assert.equal(f.calls.oauthConfigs, 0);
+      assert.equal(f.calls.renewals, 0);
+      assert.equal(f.calls.userinfo, 0);
+      assert.equal(f.calls.commits, 0);
+      assert.deepEqual(f.calls.lockPolicies, []);
+      assert.equal(f.principalMap.size, 0);
+      assert.deepEqual(f.value, replacement);
+    });
+  }
+});
+
+test('a matching expected credential binds normally and later access rereads and renews native tokens', async () => {
+  const initial = native();
+  let account = 'account-A';
+  const f = fixture(initial, { userinfo: () => json({ id: account }) });
+  const session = f.freshSession();
+  const config = { authMethod: 'auto' };
+  const result = await session.profile({ expectedCredential: encode(initial), config });
+  const nativeBinding = session.binding(result);
+  assert.equal(result.token.access_token, initial.token.access_token);
+  assert.equal(f.calls.userinfo, 1);
+  assert.equal(f.calls.renewals, 0);
+  assert.deepEqual(config, { authMethod: 'auto' });
+  f.value = { ...f.value, token: { ...f.value.token, access_token: 'externally-renewed-access' } };
+  const current = await session.profile({ config: { nativeBinding } });
+  assert.equal(current.token.access_token, 'externally-renewed-access');
+  assert.equal(session.binding(current), nativeBinding);
+  f.value = { ...f.value, token: { ...f.value.token, expiry: new Date(NOW + 299_999).toISOString() } };
+  const renewed = await session.profile({ config: { nativeBinding } });
+  assert.equal(renewed.token.access_token, 'renewed-access-1');
+  assert.equal(session.binding(renewed), nativeBinding);
+  assert.equal(f.calls.oauthConfigs, 1);
+  assert.equal(f.calls.renewals, 1);
+  assert.equal(f.calls.commits, 1);
+  assert.equal(f.calls.userinfo, 1);
+  for (const profile of [result, current, renewed, f.value]) {
+    assert.equal(Object.hasOwn(profile, 'expectedCredential'), false);
+  }
+  account = 'account-B';
+  f.value = { ...f.value, token: { ...f.value.token, access_token: 'other-access', refresh_token: 'other-refresh' } };
+  await assert.rejects(session.profile(), { code: 'ERR_NATIVE_ACCOUNT_CHANGED' });
+});
+
+test('rejects nonstring expected credentials without exposing their values', async t => {
+  for (const expectedCredential of [null, false, 0, { secret: 'expected-credential-sensitive-value' }, ['expected-credential-sensitive-value']]) {
+    await t.test(JSON.stringify(expectedCredential), async () => {
+      const f = fixture();
+      await assert.rejects(f.session.profile({ expectedCredential, forceRefresh: true }), error => {
+        assert.equal(error.code, 'ERR_NATIVE_FORMAT');
+        assert.equal(error.cause, undefined);
+        assert.equal(inspect(error, { depth: null }).includes('expected-credential-sensitive-value'), false);
+        return true;
+      });
+      assert.equal(f.calls.reads, 0);
+      assert.equal(f.calls.oauthConfigs, 0);
+      assert.equal(f.calls.renewals, 0);
+      assert.equal(f.calls.userinfo, 0);
+      assert.equal(f.calls.commits, 0);
+      assert.equal(f.principalMap.size, 0);
+    });
+  }
 });
 
 test('shares one renewal while one waiting consumer cancels', async () => {
@@ -781,4 +866,27 @@ test('a denied guarded commit retains actionable access error and preserves the 
   });
   assert.equal(f.calls.commits, 0);
   assert.deepEqual(f.value, original);
+});
+
+test('browser OAuth configuration validates explicit methods and requires installed client evidence', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'antigravity-login-client-fixture-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const options = { appPath: directory };
+  for (const config of [undefined, null, [], { authMethod: 'auto' }, { authMethod: 'business_licensed_enterprise' }, { authMethod: 'wif' }, { authMethod: 'wif', wifProvider: ' ' }, { authMethod: 'wif', wifProvider: false }]) {
+    await assert.rejects(nativeOAuthConfig(config, options), { code: 'ERR_NATIVE_METHOD' });
+  }
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await assert.rejects(nativeOAuthConfig({ authMethod: 'gcp' }, { ...options, signal: cancelled.signal }), { name: 'AbortError' });
+  await assert.rejects(nativeOAuthConfig({ authMethod: 'gcp' }, options), error => {
+    assert.equal(error.code, 'ERR_NATIVE_CLIENT');
+    assert.match(error.message, /installed Antigravity app/);
+    assert.equal(inspect(error, { depth: null }).includes(directory), false);
+    return true;
+  });
+  const bin = join(directory, 'Contents/Resources/bin');
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(bin, 'language_server'), 'synthetic binary fixture without supported OAuth configuration');
+  await assert.rejects(nativeOAuthConfig({ authMethod: 'gcp' }, options), { code: 'ERR_NATIVE_CLIENT', message: /supported enterprise OAuth configuration/ });
+  await assert.rejects(nativeOAuthConfig({ authMethod: 'wif', wifProvider: 'synthetic-provider' }, options), { code: 'ERR_NATIVE_CLIENT', message: /expected workforce OAuth client/ });
 });

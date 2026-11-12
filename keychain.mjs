@@ -7,7 +7,7 @@ const IDENTIFIER = 'com.magpie.antigravity-enterprise.keychain';
 const builds = new Map();
 const verified = new Map();
 const messages = {
-  missing: ['ERR_NATIVE_KEYCHAIN_MISSING', 'Sign in to the enterprise account in Antigravity before connecting.'],
+  missing: ['ERR_NATIVE_KEYCHAIN_MISSING', 'No enterprise credential is stored in macOS Keychain. Sign in explicitly to connect.'],
   interaction: ['ERR_NATIVE_KEYCHAIN_ACCESS', 'macOS Keychain requires authorization. Reconnect explicitly and allow the Antigravity credential helper when prompted.'],
   denied: ['ERR_NATIVE_KEYCHAIN_ACCESS', 'macOS denied access to the Antigravity Keychain credential. Reconnect explicitly to authorize the credential helper.'],
   cancelled: ['ERR_NATIVE_KEYCHAIN_ACCESS', 'Keychain authorization was cancelled. Reconnect explicitly when you are ready to allow access.'],
@@ -153,57 +153,90 @@ export async function prepareKeychainHelper(stateDir, { signal } = {}) {
   }
 }
 
-export async function readCredential(stateDir, { signal, interactive = false } = {}) {
+export async function readCredential(stateDir, { signal, interactive = false, _keychain } = {}) {
   const executable = await prepareKeychainHelper(stateDir, { signal });
-  const { stdout } = await command(executable, ['read', interactive === true ? 'interactive' : 'noninteractive'], { signal });
+  const args = ['read', interactive === true ? 'interactive' : 'noninteractive'];
+  if (_keychain) args.push('--keychain', _keychain);
+  const { stdout } = await command(executable, args, { signal });
   return stdout;
 }
 
-export async function withRefreshLock(stateDir, task, signal, { interactive = false } = {}) {
+async function withLockProcess(stateDir, run, signal, { interactive = false, _keychain } = {}) {
   const executable = await prepareKeychainHelper(stateDir, { signal });
   checkAbort(signal);
   let child;
   let announce;
   let failReady;
   const ready = new Promise((resolve, reject) => { announce = resolve; failReady = reject; });
+  const args = ['lock', interactive === true ? 'interactive' : 'noninteractive', join(stateDir, 'refresh.lock')];
+  if (_keychain) args.push('--keychain', _keychain);
   const finished = new Promise((resolve, reject) => {
-    child = execFile(executable, ['lock', interactive === true ? 'interactive' : 'noninteractive', join(stateDir, 'refresh.lock')], {
-      encoding: 'utf8', signal, timeout: 120_000, killSignal: 'SIGKILL', maxBuffer: 1024,
-    }, (error, stdout) => {
-      if (error) {
-        const safe = signal?.aborted ? aborted() : exitError(error.code);
-        failReady(safe);
-        reject(safe);
-      } else if (!stdout.startsWith('locked\n')) {
-        const safe = new KeychainError();
-        failReady(safe);
-        reject(safe);
-      } else resolve(stdout);
-    });
-    let output = '';
-    child.stdout.on('data', chunk => {
-      output += chunk;
-      if (output.startsWith('locked\n')) announce();
-    });
-    child.stdin.on('error', () => {});
+    try {
+      child = execFile(executable, args, {
+        encoding: 'utf8', signal, timeout: 120_000, killSignal: 'SIGKILL', maxBuffer: 1024,
+      }, (error, stdout) => {
+        if (error) {
+          const safe = signal?.aborted ? aborted() : exitError(error.code);
+          failReady(safe);
+          reject(safe);
+        } else if (!stdout.startsWith('locked\n')) {
+          const safe = new KeychainError();
+          failReady(safe);
+          reject(safe);
+        } else resolve(stdout);
+      });
+      let output = '';
+      child.stdout.on('data', chunk => {
+        output += chunk;
+        if (output.startsWith('locked\n')) announce();
+      });
+      child.stdin.on('error', () => {});
+    } catch {
+      const safe = signal?.aborted ? aborted() : new KeychainError();
+      failReady(safe);
+      reject(safe);
+    }
   });
   finished.catch(() => {});
-  let committed = false;
+  let sent = false;
+  const send = async payload => {
+    if (sent) throw new KeychainError();
+    sent = true;
+    child.stdin.end(payload);
+    const output = await finished;
+    if (output === 'locked\nchanged\n') return false;
+    if (output !== 'locked\nsaved\n') throw new KeychainError();
+    return true;
+  };
   try {
     await ready;
-    return await task({
-      async commit(expected, replacement) {
-        if (committed) throw new KeychainError();
-        committed = true;
-        child.stdin.end(JSON.stringify({ expected, replacement }) + '\n');
-        const output = await finished;
-        if (output === 'locked\nchanged\n') return false;
-        if (output !== 'locked\nsaved\n') throw new KeychainError();
-        return true;
-      },
-    });
+    return await run(send);
   } finally {
-    if (!committed) child.stdin.end('\n');
+    if (!sent) child?.stdin.end('\n');
     await finished;
   }
+}
+
+export async function installCredential(stateDir, expected, replacement, { signal, interactive = false, _keychain } = {}) {
+  checkAbort(signal);
+  if ((expected !== null && typeof expected !== 'string') || typeof replacement !== 'string') {
+    throw new KeychainError();
+  }
+  const request = JSON.stringify({ operation: 'install', expected, replacement }) + '\n';
+  if (Buffer.byteLength(request, 'utf8') > 2 * 1024 * 1024) throw new KeychainError();
+  return withLockProcess(
+    stateDir,
+    send => send(request),
+    signal,
+    { interactive, _keychain },
+  );
+}
+
+export async function withRefreshLock(stateDir, task, signal, options = {}) {
+  return withLockProcess(stateDir, send => task({
+    async commit(expected, replacement) {
+      if (typeof expected !== 'string' || typeof replacement !== 'string') throw new KeychainError();
+      return send(JSON.stringify({ expected, replacement }) + '\n');
+    },
+  }), signal, options);
 }

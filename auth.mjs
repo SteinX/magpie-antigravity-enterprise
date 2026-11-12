@@ -133,6 +133,51 @@ async function installedClientConfig(appPath, profile) {
   return { url: 'https://oauth2.googleapis.com/token', clientId: CLOUD_CLIENT, clientSecret: native.cloudSecret, authStyle: 'form' };
 }
 
+async function raceAbort(promise, signal) {
+  checkAbort(signal);
+  if (!signal) return await promise;
+  let onAbort;
+  const cancelled = new Promise((_, reject) => {
+    onAbort = () => reject(aborted());
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    const result = await Promise.race([promise, cancelled]);
+    checkAbort(signal);
+    return result;
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
+/** Selects validated OAuth client metadata from the installed Antigravity app. */
+export async function nativeOAuthConfig(config, options = {}) {
+  const signal = options?.signal;
+  try {
+    checkAbort(signal);
+    if (!config || typeof config !== 'object' || Array.isArray(config) || (config.authMethod !== 'gcp' && config.authMethod !== 'wif')) {
+      throw failure('ERR_NATIVE_METHOD', 'Choose a supported enterprise authentication method.');
+    }
+    if (config.wifProvider !== undefined && typeof config.wifProvider !== 'string') {
+      throw failure('ERR_NATIVE_METHOD', 'The native workforce identity provider is invalid.');
+    }
+    const wifProvider = config.authMethod === 'wif' ? config.wifProvider?.trim() ?? '' : '';
+    if (config.authMethod === 'wif' && !wifProvider) {
+      throw failure('ERR_NATIVE_METHOD', 'The native workforce account has no identity provider.');
+    }
+    const client = await raceAbort(installedClientConfig(options?.appPath ?? APP, {
+      auth_method: config.authMethod,
+      wif_provider: wifProvider,
+    }), signal);
+    checkAbort(signal);
+    return client;
+  } catch (error) {
+    if (signal?.aborted || error?.name === 'AbortError') throw aborted();
+    if (error instanceof NativeAuthError) throw error;
+    throw failure('ERR_NATIVE_CLIENT', 'The installed Antigravity app could not be read; install Antigravity.app before signing in.');
+  }
+}
+
 
 function subscribe(flight, signal) {
   checkAbort(signal);
@@ -363,11 +408,19 @@ export function createNativeSession(options = {}) {
   }
 
   return {
-    async profile({ signal, forceRefresh = false, config, interactive = false } = {}) {
+    async profile({ signal, forceRefresh = false, config, interactive = false, expectedCredential } = {}) {
       try {
         checkAbort(signal);
+        if (expectedCredential !== undefined && typeof expectedCredential !== 'string') {
+          throw failure('ERR_NATIVE_FORMAT', 'The expected native credential must be a string.');
+        }
         interactive = interactive === true;
         const initial = await read(signal, interactive);
+        // Browser sign-in may race a different account replacing the shared item.
+        // Check its transient snapshot before consulting identity or configuration.
+        if (expectedCredential !== undefined && initial.raw !== expectedCredential) {
+          throw failure('ERR_NATIVE_ACCOUNT_CHANGED', 'The native Antigravity account changed before sign-in completed; reconnect explicitly.');
+        }
         validateConfig(initial.profile, config);
         const known = await cachedPrincipal(initial.profile);
         if (known) checkBinding({ ...initial.profile, _principal: known }, config);

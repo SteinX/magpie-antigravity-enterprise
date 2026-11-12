@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { chmod, copyFile, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { prepareKeychainHelper } from './keychain.mjs';
+import { installCredential, prepareKeychainHelper, readCredential, withRefreshLock } from './keychain.mjs';
 
 // Native integration is opt-in so the ordinary consumer suite neither compiles
 // Swift nor accesses any Keychain. Every native operation below uses an explicit
@@ -36,7 +36,7 @@ func require(_ status: OSStatus) {
     if status == errSecAuthFailed { exit(12) }
     guard status == errSecSuccess else { exit(20) }
 }
-if operation == "create" {
+if operation == "create" || operation == "create-empty" {
     require(path.withCString { location in
         password.withUnsafeBytes { bytes in
             SecKeychainCreate(location, UInt32(bytes.count), bytes.baseAddress, false, nil, &keychain)
@@ -52,9 +52,10 @@ if operation == "unlock" {
     require(password.withUnsafeBytes { bytes in SecKeychainUnlock(keychain, UInt32(bytes.count), bytes.baseAddress, true) })
     exit(0)
 }
-if operation == "create" {
-    guard args.count == 3 else { exit(2) }
+if operation == "create" || operation == "create-empty" {
+    guard args.count == (operation == "create" ? 3 : 2) else { exit(2) }
     require(password.withUnsafeBytes { bytes in SecKeychainUnlock(keychain, UInt32(bytes.count), bytes.baseAddress, true) })
+    if operation == "create-empty" { exit(0) }
     var own: SecTrustedApplication?
     var helper: SecTrustedApplication?
     require(SecTrustedApplicationCreateFromPath(nil, &own))
@@ -94,8 +95,14 @@ test('native helper reuses its signed identity and enforces noninteractive read/
   const stateDir = join(directory, 'state');
   const keychain = join(directory, 'private-fixture.keychain');
   let fixture;
+  let freshKeychain;
   t.after(async () => {
-    try { if (fixture) await invoke(fixture, ['delete', keychain]); }
+    try {
+      if (fixture) {
+        await invoke(fixture, ['delete', keychain]);
+        if (freshKeychain) await invoke(fixture, ['delete', freshKeychain]);
+      }
+    }
     finally { await rm(directory, { recursive: true, force: true }); }
   });
   const helper = await prepareKeychainHelper(stateDir);
@@ -144,6 +151,28 @@ test('native helper reuses its signed identity and enforces noninteractive read/
   assert.equal(lockedCommit.stderr, '');
   assert.equal((await invoke(fixture, ['unlock', keychain])).code, 0);
   assert.equal((await read()).stdout, 'synthetic-native-rotated');
+
+  freshKeychain = join(directory, 'private-install-fixture.keychain');
+  assert.equal((await invoke(fixture, ['create-empty', freshKeychain])).code, 0);
+  const isolated = { _keychain: freshKeychain };
+  await assert.rejects(readCredential(stateDir, isolated), { code: 'ERR_NATIVE_KEYCHAIN_MISSING' });
+  await assert.rejects(withRefreshLock(stateDir, lock => lock.commit('synthetic-missing', 'must-not-create'), undefined, isolated), { code: 'ERR_NATIVE_KEYCHAIN_MISSING' });
+  await assert.rejects(readCredential(stateDir, isolated), { code: 'ERR_NATIVE_KEYCHAIN_MISSING' });
+  assert.equal(await installCredential(stateDir, 'synthetic-missing', 'must-not-create', isolated), false);
+  assert.equal(await installCredential(stateDir, null, 'synthetic-installed-original', isolated), true);
+  assert.equal(await readCredential(stateDir, isolated), 'synthetic-installed-original');
+  assert.equal(await installCredential(stateDir, 'synthetic-installed-original', 'synthetic-installed-rotated', isolated), true);
+  assert.equal(await installCredential(stateDir, 'stale-installed-value', 'must-not-be-written', isolated), false);
+  assert.equal(await installCredential(stateDir, null, 'must-not-be-written', isolated), false);
+  assert.equal(await readCredential(stateDir, isolated), 'synthetic-installed-rotated');
+  assert.equal(await withRefreshLock(stateDir, lock => lock.commit('synthetic-installed-rotated', 'synthetic-refreshed'), undefined, isolated), true);
+  assert.equal(await readCredential(stateDir, isolated), 'synthetic-refreshed');
+  for (const reader of [fixture, outsider]) {
+    const helperOnly = await invoke(reader, ['read', freshKeychain]);
+    assert.ok([11, 12].includes(helperOnly.code), 'A newly installed item must trust only the signed helper');
+    assert.equal(helperOnly.stdout, '');
+    assert.equal(helperOnly.stderr, '');
+  }
 
   // An altered cached executable must fail closed instead of being re-signed or
   // overwritten at an already-authorized path.

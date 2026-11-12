@@ -1,6 +1,9 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { AntigravityEnterprisePlugin } from "./index.mjs"
+import { createNativeSession } from "./auth.mjs"
+import { KeychainError } from "./keychain.mjs"
+import { EnterpriseLoginError } from "./login.mjs"
 
 const endpoint = "https://businessaicode.googleapis.com/v1beta/models/gemini-3.8-flash-low:generateContent"
 const encoder = new TextEncoder()
@@ -750,7 +753,7 @@ async function signInFixture(responses, { renewedBinding = "signing-account" } =
   const requests = []
   const createNativeSession = () => {
     const owner = sessions.length
-    let unlocked = owner === 0
+    let unlocked = false
     const session = {
       async profile(options = {}) {
         profiles.push({ owner, ...options })
@@ -758,7 +761,7 @@ async function signInFixture(responses, { renewedBinding = "signing-account" } =
         if (!unlocked && !options.interactive) throw new Error("Explicit Keychain access is required")
         unlocked = true
         return {
-          owner, account: owner === 0 ? "previous-account" : options.forceRefresh ? renewedBinding : "signing-account",
+          owner, account: options.forceRefresh ? renewedBinding : "signing-account",
           project_id: "licensed-project", region: "eu",
           token: { access_token: `${options.forceRefresh ? "renewed" : "native"}-${owner}` },
         }
@@ -779,7 +782,7 @@ async function signInFixture(responses, { renewedBinding = "signing-account" } =
     return response
   }
   const plugin = await AntigravityEnterprisePlugin({}, { _deps: { createNativeSession, fetch } })
-  return { plugin, method: plugin.auth.methods[0], sessions, profiles, requests }
+  return { plugin, method: plugin.auth.methods.find((method) => method.type === "api"), sessions, profiles, requests }
 }
 
 test("explicit login can unlock Keychain and renew licenses with its own account session", async () => {
@@ -798,12 +801,12 @@ test("explicit login can unlock Keychain and renew licenses with its own account
   assert.equal(result.metadata.userTier, "selected-tier")
   assert.equal(result.metadata.tierDisplayName, "Selected enterprise")
   assert.equal(rejected.bodyUsed, true)
-  assert.deepEqual(f.requests.map((request) => request.headers.get("authorization")), ["Bearer native-2", "Bearer renewed-2"])
-  assert.ok(f.requests.every((request) => request.url.endsWith(":fetchLicenses") && request.headers.get("user-agent") === "antigravity/account-2"))
-  assert.deepEqual(f.profiles.filter((options) => options.owner === 2).map((options) => [options.forceRefresh ?? false, options.interactive]), [[false, true], [true, true]])
+  assert.deepEqual(f.requests.map((request) => request.headers.get("authorization")), ["Bearer native-1", "Bearer renewed-1"])
+  assert.ok(f.requests.every((request) => request.url.endsWith(":fetchLicenses") && request.headers.get("user-agent") === "antigravity/account-1"))
+  assert.deepEqual(f.profiles.filter((options) => options.owner === 1).map((options) => [options.forceRefresh ?? false, options.interactive]), [[false, true], [true, true]])
   const models = await f.plugin.provider.models({}, { auth: { type: "api", metadata: result.metadata } })
   assert.deepEqual(Object.keys(models), ["signed-in-model"])
-  assert.equal(f.requests[2].headers.get("user-agent"), "antigravity/account-2")
+  assert.equal(f.requests[2].headers.get("user-agent"), "antigravity/account-1")
   assert.equal(f.profiles.at(-1).interactive, false)
 })
 
@@ -833,6 +836,458 @@ test("license 401 renews only once and license 403 never renews or exposes priva
     assert.equal(result.error.includes(secret), false)
     assert.equal(f.requests.length, responses.length)
     assert.deepEqual(f.profiles.map((options) => options.forceRefresh ?? false), status === 401 ? [false, true] : [false])
+  }
+})
+
+const loginConfig = { projectId: "licensed-project", location: "eu", authMethod: "gcp" }
+const loginToken = { access_token: "fresh-oauth-access", refresh_token: "fresh-oauth-refresh", expires_in: 3600, token_type: "Bearer", id_token: "private-id-token" }
+const loginLicense = { projectId: "licensed-project", location: "eu", userTier: "enterprise-tier", tierDisplayName: "Enterprise license" }
+
+async function browserSignInFixture({ storedRaw = null, responses = [json({ licenses: [loginLicense] })] } = {}) {
+  const reads = [], installs = [], profiles = [], identities = [], requests = [], starts = [], sessions = []
+  let credential = storedRaw
+  const flow = { closed: 0, async wait() { return { ...loginToken } }, close() { this.closed++ } }
+  const deps = {
+    async readLoginCredential(stateDir, options) {
+      reads.push({ stateDir, ...options })
+      if (credential === null) throw Object.assign(new Error("No native account exists"), { code: "ERR_NATIVE_KEYCHAIN_MISSING" })
+      return credential
+    },
+    async installLoginCredential(stateDir, expected, replacement, options) {
+      installs.push({ stateDir, expected, replacement, ...options })
+      if (credential !== expected) return false
+      credential = replacement
+      return true
+    },
+    async startEnterpriseLogin(config, options, context) {
+      starts.push({ config, options, ...context })
+      return { ...flow, url: "https://accounts.example.test/enterprise", wait: (...args) => flow.wait(...args), close: () => flow.close() }
+    },
+    createNativeSession() {
+      const owner = sessions.length
+      const session = {
+        async profile(options) {
+          profiles.push({ owner, ...options })
+          options.signal?.throwIfAborted()
+          assert.ok(installs.length, "Native credentials must only be resolved after a guarded install")
+          const installed = JSON.parse(Buffer.from(credential.slice("go-keyring-base64:".length), "base64").toString())
+          return { ...installed, _principal: "verified-new-principal" }
+        },
+        async identity(profile) {
+          identities.push({ owner, profile: structuredClone(profile) })
+          return `antigravity/browser-session-${owner}`
+        },
+        binding(profile) {
+          assert.equal(profile._principal, "verified-new-principal")
+          return "verified-new-binding"
+        },
+      }
+      sessions.push(session)
+      return session
+    },
+    async fetch(url, init) {
+      requests.push({ url, ...init, headers: new Headers(init.headers) })
+      const response = responses[requests.length - 1]
+      assert.ok(response, "An unexpected browser sign-in request was made")
+      return typeof response === "function" ? response() : response
+    },
+  }
+  const plugin = await AntigravityEnterprisePlugin({}, { stateDir: "/private/login-state", _deps: deps })
+  return { plugin, method: plugin.auth.methods.find((method) => method.type === "oauth"), reads, installs, profiles, identities, requests, starts, sessions, flow, deps,
+    get credential() { return credential }, set credential(value) { credential = value } }
+}
+
+test("primary browser sign-in prompts without local credentials and starts a fresh install", async () => {
+  const f = await browserSignInFixture()
+  assert.equal(f.plugin.auth.methods[0], f.method)
+  assert.equal(f.method.label, "Sign in with enterprise account")
+  const inputs = {}
+  for (const [key, value] of Object.entries(loginConfig)) {
+    const prompt = await f.method.ask(inputs)
+    assert.equal(prompt.key, key)
+    if (key === "authMethod") assert.deepEqual(prompt.options.map((option) => option.value), ["gcp", "wif"])
+    inputs[key] = value
+  }
+  assert.equal(await f.method.ask(inputs), null)
+  assert.equal((await f.method.ask({ ...inputs, authMethod: "wif" })).key, "wifProvider")
+  assert.equal(f.reads.length, 0)
+  assert.equal(f.profiles.length, 0)
+  const result = await f.method.authorize(inputs)
+  assert.equal(result.url, "https://accounts.example.test/enterprise")
+  assert.equal(result.method, "auto")
+  assert.equal(result.opened, false)
+  assert.match(result.instructions, /Complete/)
+  assert.equal(f.reads.length, 1)
+  assert.equal(f.reads[0].interactive, true)
+  assert.equal(f.reads[0].stateDir, "/private/login-state")
+  assert.deepEqual(f.starts[0].config, { ...loginConfig, wifProvider: "" })
+  assert.equal(f.profiles.length, 0)
+  assert.equal(f.installs.length, 0)
+  await result.callback()
+  assert.equal(f.flow.closed, 1)
+})
+
+test("fresh OAuth validates the exact license before installing a native profile and exposes only API reference metadata", async () => {
+  const oldRaw = "previous raw credential need not decode"
+  const f = await browserSignInFixture({ storedRaw: oldRaw, responses: [() => {
+    assert.equal(f.installs.length, 0)
+    assert.equal(f.profiles.length, 0)
+    assert.equal(f.credential, oldRaw)
+    return json({ licenses: [{ ...loginLicense, projectId: "unrelated-project" }, loginLicense] })
+  }, json({ models: { "new-account-model": { displayName: "New account model" } } })] })
+  const authorized = await f.method.authorize({ ...loginConfig, wifProvider: "ignored-for-gcp" })
+  const earliestExpiry = Date.now() + 3_600_000
+  const result = await authorized.callback()
+  assert.equal(result.type, "success")
+  assert.equal(result.key, "native-keychain:verified-new-binding")
+  assert.equal(result.accountId, "licensed-project/eu/verified-new")
+  assert.deepEqual(result.metadata, { ...loginConfig, wifProvider: "", nativeBinding: "verified-new-binding", userTier: "enterprise-tier", tierDisplayName: "Enterprise license" })
+  assert.equal(f.installs.length, 1)
+  assert.equal(f.installs[0].expected, oldRaw)
+  assert.equal(f.installs[0].interactive, true)
+  assert.equal(f.installs[0].stateDir, "/private/login-state")
+  const installed = JSON.parse(Buffer.from(f.installs[0].replacement.slice("go-keyring-base64:".length), "base64").toString())
+  assert.deepEqual({ ...installed, token: undefined }, { auth_method: "gcp", wif_provider: "", project_id: "licensed-project", region: "eu", user_tier: "enterprise-tier", tier_display_name: "Enterprise license", token: undefined })
+  assert.deepEqual({ ...installed.token, expiry: undefined }, { access_token: "fresh-oauth-access", refresh_token: "fresh-oauth-refresh", token_type: "Bearer", expiry: undefined })
+  assert.ok(Date.parse(installed.token.expiry) >= earliestExpiry)
+  assert.ok(Date.parse(installed.token.expiry) <= Date.now() + 3_600_000)
+  assert.equal(f.identities[0].profile.user_tier, "")
+  assert.equal(Object.hasOwn(f.identities[0].profile, "_principal"), false)
+  assert.equal(f.requests[0].headers.get("authorization"), "Bearer fresh-oauth-access")
+  assert.equal(f.requests[0].headers.get("user-agent"), "antigravity/browser-session-0")
+  assert.equal(f.profiles.length, 1)
+  assert.equal(f.profiles[0].interactive, true)
+  assert.equal(f.profiles[0].forceRefresh ?? false, false)
+  assert.equal(f.flow.closed, 1)
+  const serialized = JSON.stringify(result)
+  for (const secret of Object.values(loginToken).filter((value) => typeof value === "string" && value !== "Bearer")) assert.equal(serialized.includes(secret), false)
+  assert.equal(serialized.includes("go-keyring-base64:"), false)
+  const models = await f.plugin.provider.models({}, { auth: { type: "api", metadata: result.metadata } })
+  assert.deepEqual(Object.keys(models), ["new-account-model"])
+  assert.equal(f.profiles.at(-1).owner, 0)
+  assert.equal(f.profiles.at(-1).interactive, false)
+})
+
+test("fresh login rejects unrelated or denied licenses without installing credentials or renewing the previous account", async () => {
+  for (const response of [
+    json({ licenses: [{ ...loginLicense, projectId: "another-project" }] }),
+    json({ licenses: [{ ...loginLicense, location: "us" }] }),
+    json({ licenses: [{ ...loginLicense, userTier: "" }] }),
+    json({ licenses: [{ ...loginLicense, userTier: 123 }] }),
+    json({ error: { message: "private license secret" } }, 401),
+    json({ error: { message: "private license secret" } }, 403),
+  ]) {
+    const f = await browserSignInFixture({ storedRaw: "old raw", responses: [response] })
+    const result = await (await f.method.authorize(loginConfig)).callback()
+    assert.equal(result.type, "failed")
+    assert.equal(f.credential, "old raw")
+    assert.equal(f.installs.length, 0)
+    assert.equal(f.profiles.length, 0)
+    assert.equal(f.requests.length, 1)
+    assert.equal(f.flow.closed, 1)
+    assert.equal(JSON.stringify(result).includes("private license secret"), false)
+  }
+})
+
+test("guarded fresh login preserves an account that Antigravity changed during browser sign-in", async () => {
+  const f = await browserSignInFixture({ storedRaw: "original native credential" })
+  const authorized = await f.method.authorize(loginConfig)
+  f.credential = "new credential written by Antigravity"
+  const result = await authorized.callback()
+  assert.equal(result.type, "failed")
+  assert.match(result.error, /changed/i)
+  assert.equal(f.credential, "new credential written by Antigravity")
+  assert.equal(f.installs.length, 1)
+  assert.equal(f.profiles.length, 0)
+  assert.equal(f.flow.closed, 1)
+})
+
+test("fresh login rejects a native account switch after installation before verification", async () => {
+  const encode = (profile) => "go-keyring-base64:" + Buffer.from(JSON.stringify(profile)).toString("base64")
+  const accountB = encode({
+    token: { access_token: "account-b-access", refresh_token: "account-b-refresh", token_type: "Bearer", expiry: new Date(Date.now() + 3_600_000).toISOString() },
+    auth_method: "gcp", wif_provider: "", project_id: loginConfig.projectId, region: loginConfig.location, user_tier: "account-b-tier",
+  })
+  let credential = "old native credential"
+  let installed
+  let sessionCount = 0
+  let oldProfileCalls = 0
+  const principals = new Map()
+  const nativeRequests = []
+  const requests = []
+  const oldSession = {
+    async profile() { oldProfileCalls++; return { token: { access_token: "old-access" } } },
+    binding: () => "previous-binding",
+    identity: async () => "antigravity/previous-session",
+  }
+  const nativeDeps = {
+    readCredential: async () => credential,
+    readPrincipal: async (key) => principals.get(key),
+    writePrincipal: async (key, principal) => { principals.set(key, principal) },
+    metadata: async () => ({ version: "1.5.5", cl: "1017970541", platform: "darwin", arch: "arm64" }),
+    fetch: async (url, init) => {
+      nativeRequests.push({ url, headers: new Headers(init.headers) })
+      return json({ id: "account-b" })
+    },
+  }
+  const plugin = await AntigravityEnterprisePlugin({}, { _deps: {
+    createNativeSession: () => sessionCount++ === 0 ? oldSession : createNativeSession({ _deps: nativeDeps }),
+    readLoginCredential: async () => credential,
+    installLoginCredential: async (_stateDir, expected, replacement) => {
+      assert.equal(expected, credential)
+      installed = replacement
+      credential = replacement
+      credential = accountB
+      return true
+    },
+    startEnterpriseLogin: async () => ({ url: "https://accounts.example.test/enterprise", wait: async () => ({ ...loginToken }), close() {} }),
+    fetch: async (url, init) => {
+      requests.push({ url, headers: new Headers(init.headers) })
+      return url.endsWith(":fetchLicenses") ? json({ licenses: [loginLicense] }) : json({ models: { old: { displayName: "Old model" } } })
+    },
+  } })
+  const oldMetadata = { ...loginConfig, wifProvider: "", nativeBinding: "previous-binding", userTier: "previous-tier" }
+  const method = plugin.auth.methods.find((item) => item.type === "oauth")
+  const previousModels = await plugin.provider.models({}, { auth: { type: "api", metadata: oldMetadata } })
+  assert.deepEqual(Object.keys(previousModels), ["old"])
+  const result = await (await method.authorize(loginConfig)).callback()
+  assert.equal(result.type, "failed")
+  assert.match(result.error, /changed/i)
+  assert.equal(Object.hasOwn(result, "metadata"), false)
+  assert.equal(Object.hasOwn(result, "key"), false)
+  assert.equal(credential, accountB)
+  const installedProfile = JSON.parse(Buffer.from(installed.slice("go-keyring-base64:".length), "base64").toString())
+  assert.equal(installedProfile.token.access_token, loginToken.access_token)
+  assert.equal(installedProfile.user_tier, loginLicense.userTier)
+  assert.deepEqual(nativeRequests, [])
+  assert.equal(principals.size, 0)
+  assert.equal(requests.length, 2)
+  assert.equal(requests[1].headers.get("authorization"), `Bearer ${loginToken.access_token}`)
+
+  const models = await plugin.provider.models({}, { auth: { type: "api", metadata: oldMetadata } })
+  assert.deepEqual(Object.keys(models), ["old"])
+  assert.equal(oldProfileCalls, 2)
+  assert.equal(requests[2].headers.get("authorization"), "Bearer old-access")
+  assert.equal(requests.some(({ headers }) => headers.get("authorization") === "Bearer account-b-access"), false)
+})
+
+test("a long-lived provider follows an independently signed-in native account without rebinding the previous account", async () => {
+  const encode = (profile) => "go-keyring-base64:" + Buffer.from(JSON.stringify(profile)).toString("base64")
+  const profileFor = (account) => ({
+    token: { access_token: `${account}-access`, refresh_token: `${account}-refresh`, token_type: "Bearer", expiry: new Date(Date.now() + 3_600_000).toISOString() },
+    auth_method: "gcp", wif_provider: "", project_id: "licensed-project", region: "eu", user_tier: `${account}-tier`,
+  })
+  let credential = encode(profileFor("account-a"))
+  const principals = new Map()
+  const requests = []
+  const deps = {
+    readCredential: async ({ interactive }) => {
+      assert.notEqual(interactive, true, "Saved-account requests must not prompt for Keychain authorization")
+      return credential
+    },
+    readPrincipal: async (key) => principals.get(key),
+    writePrincipal: async (key, principal) => { principals.set(key, principal) },
+    metadata: async () => ({ version: "1.5.5", cl: "1017970541", platform: "darwin", arch: "arm64" }),
+    async fetch(url, init) {
+      const headers = new Headers(init.headers)
+      const authorization = headers.get("authorization")
+      assert.ok(["Bearer account-a-access", "Bearer account-b-access"].includes(authorization))
+      if (url === "https://www.googleapis.com/oauth2/v2/userinfo") return json({ id: authorization === "Bearer account-a-access" ? "account-a" : "account-b" })
+      requests.push({ url, headers, payload: JSON.parse(init.body) })
+      if (url.endsWith(":retrieveUserQuotaSummary")) return json(quotaSummary)
+      if (url.endsWith(":fetchAvailableModels")) return json({ models: { "account-b-model": { displayName: "Account B model" } } })
+      assert.match(url, /:streamGenerateContent/)
+      return sse()
+    },
+  }
+  const options = { _deps: deps }
+  const metadataForCurrentAccount = async (tier) => {
+    const independentSession = createNativeSession(options)
+    const profile = await independentSession.profile()
+    return { type: "api", metadata: { ...loginConfig, wifProvider: "", nativeBinding: independentSession.binding(profile), userTier: tier } }
+  }
+  const authA = await metadataForCurrentAccount("account-a-tier")
+  let currentAuth = authA
+  const plugin = await AntigravityEnterprisePlugin({}, options)
+  const client = await plugin.auth.loader(async () => currentAuth)
+  await assertAnswer(await client.fetch(endpoint, { method: "POST", body: JSON.stringify(inputBody) }))
+  assert.equal(requests[0].headers.get("authorization"), "Bearer account-a-access")
+
+  credential = encode(profileFor("account-b"))
+  const authB = await metadataForCurrentAccount("account-b-tier")
+  assert.notEqual(authB.metadata.nativeBinding, authA.metadata.nativeBinding)
+  currentAuth = authB
+  const usage = await plugin.auth.usage(async () => currentAuth, quotaProvider)
+  assert.equal(usage.error, undefined)
+  assert.ok(usage.windows.length > 0)
+  const models = await plugin.provider.models({}, { auth: authB })
+  assert.deepEqual(Object.keys(models), ["account-b-model"])
+  await assertAnswer(await client.fetch(endpoint, { method: "POST", body: JSON.stringify(inputBody) }))
+  assert.equal(requests.length, 4)
+  assert.ok(requests.slice(1).every(({ headers }) => headers.get("authorization") === "Bearer account-b-access"))
+  assert.equal(requests[2].payload.entitlement.userTier, "account-b-tier")
+  assert.equal(requests[3].payload.entitlement.userTier, "account-b-tier")
+
+  const previousUsage = await plugin.auth.usage(async () => authA, quotaProvider)
+  assert.equal(previousUsage.signIn, "expired")
+  assert.match(previousUsage.error, /changed/i)
+  await assert.rejects(plugin.provider.models({}, { auth: authA }), (error) => error.code === "ERR_NATIVE_ACCOUNT_CHANGED")
+  currentAuth = authA
+  const previousGeneration = await client.fetch(endpoint, { method: "POST", body: JSON.stringify(inputBody) })
+  assert.equal(previousGeneration.status, 401)
+  assert.equal(previousGeneration.headers.get("X-Magpie-Sign-In"), "expired")
+  assert.equal(requests.length, 4, "An obsolete saved account must fail before any enterprise request")
+})
+
+test("browser sign-in validates explicit configuration before touching native credentials or starting OAuth", async () => {
+  const f = await browserSignInFixture()
+  for (const config of [
+    { ...loginConfig, authMethod: "auto" },
+    { ...loginConfig, authMethod: undefined },
+    { ...loginConfig, authMethod: "wif", wifProvider: " " },
+    { ...loginConfig, projectId: "" },
+    { ...loginConfig, location: "us-central1" },
+  ]) {
+    const result = await f.method.authorize(config)
+    assert.equal(result.type, "failed")
+  }
+  assert.equal(f.reads.length, 0)
+  assert.equal(f.starts.length, 0)
+  assert.equal(f.profiles.length, 0)
+})
+
+test("denied Keychain snapshot access requires authorization instead of being treated as an empty native account", async () => {
+  const f = await browserSignInFixture()
+  const denied = Object.assign(new KeychainError("denied"), { cause: new Error("private cause"), stdout: "private output" })
+  f.deps.readLoginCredential = async () => { throw denied }
+  const plugin = await AntigravityEnterprisePlugin({}, { _deps: f.deps })
+  const result = await plugin.auth.methods.find((method) => method.type === "oauth").authorize(loginConfig)
+  assert.equal(result.type, "failed")
+  assert.match(result.error, /macOS denied access.*Keychain/)
+  assert.match(result.error, /authorize/)
+  assert.equal(f.starts.length, 0)
+  assert.equal(f.installs.length, 0)
+  assert.equal(JSON.stringify(result).includes("private"), false)
+})
+
+test("fresh WIF profile uses only the chosen provider and does not invent a native tier display label", async () => {
+  const f = await browserSignInFixture({ responses: [json({ licenses: [{ ...loginLicense, tierDisplayName: undefined }] })] })
+  const config = { ...loginConfig, authMethod: "wif", wifProvider: " locations/global/workforcePools/enterprise/providers/sso " }
+  const result = await (await f.method.authorize(config)).callback()
+  assert.equal(result.type, "success")
+  assert.equal(f.installs[0].expected, null)
+  const installed = JSON.parse(Buffer.from(f.installs[0].replacement.slice("go-keyring-base64:".length), "base64").toString())
+  assert.equal(installed.auth_method, "wif")
+  assert.equal(installed.wif_provider, "locations/global/workforcePools/enterprise/providers/sso")
+  assert.equal(Object.hasOwn(installed, "tier_display_name"), false)
+  assert.equal(result.metadata.tierDisplayName, "enterprise-tier")
+})
+
+test("browser interaction outlives the native snapshot deadline and each later resource gets a fresh deadline", async (t) => {
+  const deadlines = []
+  t.mock.method(AbortSignal, "timeout", (milliseconds) => {
+    const controller = new AbortController()
+    deadlines.push({ milliseconds, controller })
+    return controller.signal
+  })
+  const f = await browserSignInFixture()
+  const waiting = deferred(), token = deferred()
+  f.flow.wait = ({ signal } = {}) => {
+    assert.equal(signal, undefined, "A 30-second resource deadline must not limit browser interaction")
+    waiting.resolve()
+    return token.promise
+  }
+  const authorized = await f.method.authorize(loginConfig)
+  const callback = authorized.callback()
+  await waiting.promise
+  assert.equal(deadlines.length, 1)
+  deadlines[0].controller.abort(new DOMException("Native read deadline elapsed", "TimeoutError"))
+  assert.equal(f.flow.closed, 0)
+  token.resolve(loginToken)
+  const result = await callback
+  assert.equal(result.type, "success")
+  assert.deepEqual(deadlines.map(({ milliseconds }) => milliseconds), [30_000, 30_000, 30_000, 30_000])
+  assert.notEqual(f.requests[0].signal, f.reads[0].signal)
+  assert.notEqual(f.installs[0].signal, f.requests[0].signal)
+  assert.notEqual(f.profiles[0].signal, f.installs[0].signal)
+  assert.equal(f.flow.closed, 1)
+})
+
+test("cancelling callback browser interaction closes the flow and late tokens cannot install a native account", { timeout: 5000 }, async () => {
+  const f = await browserSignInFixture()
+  const waiting = deferred(), token = deferred()
+  const controller = new AbortController()
+  f.flow.wait = () => { waiting.resolve(); return token.promise }
+  const authorized = await f.method.authorize(loginConfig)
+  const callback = authorized.callback(undefined, { signal: controller.signal })
+  await waiting.promise
+  const reason = new Error("The user cancelled enterprise sign-in")
+  controller.abort(reason)
+  await assert.rejects(callback, (error) => error === reason)
+  token.resolve(loginToken)
+  await token.promise
+  await Promise.resolve()
+  assert.equal(f.flow.closed, 1)
+  assert.equal(f.installs.length, 0)
+  assert.equal(f.requests.length, 0)
+  assert.equal(f.profiles.length, 0)
+})
+
+test("cancelling after license approval prevents native installation and closes the browser flow", async () => {
+  const controller = new AbortController()
+  const reason = new Error("Cancelled just before native install")
+  const f = await browserSignInFixture({ storedRaw: "old credential", responses: [() => {
+    controller.abort(reason)
+    return json({ licenses: [loginLicense] })
+  }] })
+  const authorized = await f.method.authorize(loginConfig)
+  await assert.rejects(authorized.callback(undefined, { signal: controller.signal }), (error) => error === reason)
+  assert.equal(f.installs.length, 0)
+  assert.equal(f.credential, "old credential")
+  assert.equal(f.flow.closed, 1)
+})
+
+test("authorization cancellation closes a flow even if Magpie never calls its callback", async () => {
+  const f = await browserSignInFixture()
+  const controller = new AbortController()
+  const authorized = await f.method.authorize(loginConfig, { signal: controller.signal })
+  controller.abort(new Error("Cancelled enterprise sign-in dialog"))
+  await Promise.resolve()
+  assert.equal(f.flow.closed, 1)
+  await assert.rejects(authorized.callback(), /Cancelled enterprise sign-in dialog/)
+  assert.equal(f.flow.closed, 1)
+  assert.equal(f.installs.length, 0)
+})
+
+test("expired and failed browser callbacks close their flow without exposing code, token, subprocess output, or causes", async () => {
+  for (const failure of [
+    new EnterpriseLoginError("ERR_LOGIN_TIMEOUT", "Enterprise sign-in expired. Start sign-in again."),
+    Object.assign(new Error("private auth-code verifier access-token"), { cause: new Error("private secret cause"), stdout: "private subprocess output" }),
+  ]) {
+    const f = await browserSignInFixture()
+    f.flow.wait = async () => { throw failure }
+    const result = await (await f.method.authorize(loginConfig)).callback()
+    assert.equal(result.type, "failed")
+    assert.equal(JSON.stringify(result).includes("private"), false)
+    assert.equal(f.flow.closed, 1)
+    assert.equal(f.installs.length, 0)
+    assert.equal(f.requests.length, 0)
+  }
+})
+
+test("malformed OAuth token fields never reach licensing or native credentials", async () => {
+  for (const token of [
+    { ...loginToken, access_token: "" }, { ...loginToken, refresh_token: "" },
+    { ...loginToken, expires_in: 0 }, { ...loginToken, expires_in: Infinity }, { ...loginToken, expires_in: Number.MAX_VALUE },
+  ]) {
+    const f = await browserSignInFixture()
+    f.flow.wait = async () => token
+    const result = await (await f.method.authorize(loginConfig)).callback()
+    assert.equal(result.type, "failed")
+    assert.equal(f.requests.length, 0)
+    assert.equal(f.installs.length, 0)
+    assert.equal(f.profiles.length, 0)
+    assert.equal(f.flow.closed, 1)
   }
 })
 
