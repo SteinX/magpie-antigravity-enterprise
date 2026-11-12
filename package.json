@@ -8,7 +8,7 @@
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
-  "files": ["index.mjs", "auth.mjs", "login.mjs", "cli-metadata.mjs", "transport.mjs", "protocol.mjs", "usage.mjs", "keychain.mjs", "keychain-helper.swift", "README.md"],
+  "files": ["index.mjs", "auth.mjs", "login.mjs", "cli-metadata.mjs", "transport.mjs", "protocol.mjs", "usage.mjs", "keychain.mjs", "keychain-helper.swift", "README.md", "CHANGELOG.md"],
   "scripts": { "test": "node --test *.test.mjs" },
   "keywords": ["magpie", "magpie-plugin", "antigravity", "enterprise"],
   "magpie": { "name": "Antigravity Enterprise", "maxConcurrency": 4 }
