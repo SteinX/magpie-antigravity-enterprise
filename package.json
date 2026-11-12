@@ -1,6 +1,6 @@
 {
   "name": "magpie-antigravity-enterprise",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "Antigravity enterprise browser sign-in and native Keychain renewal for Magpie",
   "repository": { "type": "git", "url": "https://github.com/SteinX/magpie-antigravity-enterprise.git" },

@@ -261,7 +261,116 @@ function sseParser(onEvent) {
   }
 }
 
-export async function adaptResponse(response, wantsStream, { signal } = {}) {
+function quotaResetSeconds(error) {
+  if (Array.isArray(error.details)) {
+    for (const detail of error.details) {
+      if (!isObject(detail) || detail["@type"] !== "type.googleapis.com/google.rpc.RetryInfo" || typeof detail.retryDelay !== "string") continue
+      const duration = /^((?:0|[1-9]\d*))(?:\.\d{1,9})?s$/.exec(detail.retryDelay)
+      if (!duration || Number(duration[1]) > 315576000000) continue
+      const seconds = Number(detail.retryDelay.slice(0, -1))
+      if (Number.isFinite(seconds) && seconds > 0) return seconds
+    }
+  }
+  const duration = /\bResets in\s+(\S+)/i.exec(error.message)?.[1].replace(/\.$/, "")
+  const parts = duration && /^(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)s)?$/.exec(duration)
+  if (!parts || !parts.slice(1).some((part) => part !== undefined)) return undefined
+  const seconds = Number(parts[1] ?? 0) * 3600 + Number(parts[2] ?? 0) * 60 + Number(parts[3] ?? 0)
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined
+}
+
+function localResetTime(date) {
+  const pad = (value) => String(value).padStart(2, "0")
+  const offset = -date.getTimezoneOffset()
+  const zone = `GMT${offset >= 0 ? "+" : "-"}${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ${zone}`
+}
+
+function quotaErrorBody(body, status, headers, now) {
+  if (status !== 429 || !isObject(body) || !isObject(body.error) ||
+      typeof body.error.message !== "string" || !/Quota pool exhausted/i.test(body.error.message)) return body
+  const error = body.error
+  const seconds = quotaResetSeconds(error)
+  let reset
+  if (seconds !== undefined) {
+    const dateHeader = headers.get("date")
+    const serverTime = Date.parse(dateHeader ?? "")
+    const reference = Number.isFinite(serverTime) && new Date(serverTime).toUTCString() === dateHeader ? serverTime : now()
+    const candidate = new Date(Number.isFinite(reference) ? reference + seconds * 1000 : NaN)
+    if (Number.isFinite(candidate.getTime())) reset = candidate
+  }
+  const waiting = seconds === undefined ? undefined : Math.ceil(seconds)
+  const estimate = reset ? `预计 ${localResetTime(reset)} 重置（约${Math.floor(waiting / 3600)}小时${Math.floor(waiting % 3600 / 60)}分${waiting % 60}秒）。` : ""
+  return { ...body, error: {
+    ...error,
+    type: "quota_exhausted",
+    message: `当前模型的企业额度池已耗尽（Quota pool exhausted）。${estimate}请等待重置，或联系企业管理员开启超额用量；重新登录不会恢复额度。`,
+    ...(reset ? { reset_at: reset.toISOString() } : {}),
+  } }
+}
+
+function jsonHeaders(original) {
+  const headers = new Headers(original)
+  headers.set("content-type", "application/json")
+  headers.delete("content-length")
+  headers.delete("content-encoding")
+  headers.delete("transfer-encoding")
+  return headers
+}
+
+async function clonedErrorJSON(response, signal) {
+  if (signal?.aborted) {
+    await response.body?.cancel(signal.reason).catch(() => {})
+    signal.throwIfAborted()
+  }
+  let reader
+  try { reader = response.clone().body?.getReader() } catch { return undefined }
+  if (!reader) return undefined
+  const decoder = new TextDecoder()
+  let text = ""
+  let cancellation
+  // A clone tees the body: cancel both branches together so an abort can reach
+  // the upstream source without waiting for the untouched original branch.
+  const cancel = (reason) => cancellation ??= Promise.all([
+    reader.cancel(reason).catch(() => {}),
+    response.body.cancel(reason).catch(() => {}),
+  ])
+  const onAbort = () => { void cancel(signal.reason) }
+  signal?.addEventListener("abort", onAbort, { once: true })
+  try {
+    signal?.throwIfAborted()
+    while (true) {
+      const { value, done } = await reader.read()
+      signal?.throwIfAborted()
+      if (done) break
+      text += decoder.decode(value, { stream: true })
+    }
+    return JSON.parse(text + decoder.decode())
+  } catch {
+    if (signal?.aborted) {
+      await cancel(signal.reason)
+      signal.throwIfAborted()
+    }
+    return undefined
+  } finally {
+    signal?.removeEventListener("abort", onAbort)
+    reader.releaseLock()
+  }
+}
+
+export async function adaptResponse(response, wantsStream, { signal, now = Date.now } = {}) {
+  if (response.status === 429) {
+    const body = await clonedErrorJSON(response, signal)
+    signal?.throwIfAborted()
+    const adapted = quotaErrorBody(body, response.status, response.headers, now)
+    if (adapted === body) return response
+    await response.body?.cancel().catch(() => {})
+    signal?.throwIfAborted()
+    return new Response(JSON.stringify(adapted), {
+      status: response.status,
+      statusText: response.statusText,
+      headers: jsonHeaders(response.headers),
+    })
+  }
   if (!response.ok || wantsStream || !response.body || !/^\s*text\/event-stream(?:\s*;|$)/i.test(response.headers.get("content-type") ?? "")) return response
 
   const reader = response.body.getReader()
@@ -290,15 +399,11 @@ export async function adaptResponse(response, wantsStream, { signal } = {}) {
       if (done || terminal) break
     }
     signal?.throwIfAborted()
-    const headers = new Headers(response.headers)
-    headers.set("content-type", "application/json")
-    headers.delete("content-length")
-    headers.delete("content-encoding")
-    headers.delete("transfer-encoding")
-    return new Response(JSON.stringify(failure ? failure.body : accumulator.value()), {
+    const body = failure ? quotaErrorBody(failure.body, failure.status, response.headers, now) : accumulator.value()
+    return new Response(JSON.stringify(body), {
       status: failure ? failure.status : response.status,
       statusText: failure ? undefined : response.statusText,
-      headers,
+      headers: jsonHeaders(response.headers),
     })
   } catch (error) {
     await cancel(error)

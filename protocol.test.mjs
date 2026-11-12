@@ -21,6 +21,20 @@ function sseResponse(text, fragments = [1, 2, 5, 3, 8]) {
 
 const event = (value, ending = "\n\n") => `data: ${JSON.stringify(value)}${ending}`
 
+// The message, RetryInfo duration, HTTP status, and declared SSE content type
+// match the observed enterprise rejection; other test metadata is synthetic.
+const quotaMessage = "Quota pool exhausted. Contact your administrator to enable overages. Resets in 142h13m39s."
+const quotaError = (overrides = {}) => ({
+  code: 429,
+  status: "RESOURCE_EXHAUSTED",
+  message: quotaMessage,
+  details: [
+    { "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "QUOTA_EXHAUSTED" },
+    { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "512019.277241790s" },
+  ],
+  ...overrides,
+})
+
 for (const [location, host] of [
   ["global", "businessaicode.googleapis.com"],
   ["us", "businessaicode.us.rep.googleapis.com"],
@@ -240,6 +254,214 @@ test("preserves HTTP error responses including status, headers, and body", async
   }
 })
 
+test("explains observed HTTP 429 quota exhaustion even when JSON is declared as SSE", async () => {
+  for (const wantsStream of [false, true]) {
+    const error = quotaError()
+    const upstream = new Response(JSON.stringify({ error }), {
+      status: 429,
+      statusText: "Too Many Requests",
+      headers: { "Content-Type": "Text/Event-Stream; charset=UTF-8", date: "Thu, 12 Nov 2026 11:27:18 GMT" },
+    })
+    const result = await adaptResponse(upstream, wantsStream, { now: () => 0 })
+    assert.equal(result.status, 429)
+    assert.equal(result.statusText, "Too Many Requests")
+    assert.equal(result.headers.get("content-type"), "application/json")
+    assert.equal(result.headers.has("retry-after"), false)
+    const output = (await result.json()).error
+    assert.equal(output.code, 429)
+    assert.equal(output.status, "RESOURCE_EXHAUSTED")
+    assert.equal(output.type, "quota_exhausted")
+    assert.deepEqual(output.details, error.details)
+    assert.equal(output.reset_at, "2026-11-18T09:40:57.277Z")
+    assert.match(output.message, /当前模型.*企业额度池.*耗尽/)
+    assert.match(output.message, /Quota pool exhausted/)
+    assert.match(output.message, /预计.*GMT[+-]\d{2}:\d{2}.*重置/)
+    assert.match(output.message, /等待.*重置/)
+    assert.match(output.message, /管理员.*超额用量/)
+    assert.match(output.message, /重新登录不会恢复额度/)
+    const reset = new Date(output.reset_at)
+    const offset = -reset.getTimezoneOffset()
+    const zone = `GMT${offset >= 0 ? "+" : "-"}${String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0")}:${String(Math.abs(offset) % 60).padStart(2, "0")}`
+    assert.ok(output.message.includes(zone), "reset time names the host local offset at reset")
+    assert.ok(output.message.includes(String(reset.getHours()).padStart(2, "0") + ":" + String(reset.getMinutes()).padStart(2, "0")))
+    assert.equal(output.message.includes("Contact your administrator"), false)
+  }
+})
+
+test("prefers the first valid RetryInfo duration over the message countdown", async () => {
+  const error = quotaError({ details: [
+    { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "-2s" },
+    { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "2.250s" },
+    { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "30s" },
+  ] })
+  const result = await adaptResponse(new Response(JSON.stringify({ error }), {
+    status: 429, headers: { date: "Thu, 12 Nov 2026 11:27:18 GMT" },
+  }), false)
+  const output = (await result.json()).error
+  assert.equal(output.reset_at, "2026-11-12T11:27:20.250Z")
+  assert.deepEqual(output.details, error.details)
+})
+
+test("falls back to the Go message countdown when RetryInfo is absent or invalid", async () => {
+  for (const retryDelay of [undefined, "NaNs", "Infinitys", "1e3s", "-1s", "0s", "01s", "+1s", "1.0000000000s", " 1s", 5]) {
+    const error = quotaError({
+      message: "QuOtA PoOl ExHaUsTeD. Resets in 1h2m3.5s.",
+      details: retryDelay === undefined ? [] : [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay }],
+    })
+    const result = await adaptResponse(new Response(JSON.stringify({ error }), {
+      status: 429, headers: { date: "Thu, 12 Nov 2026 11:27:18 GMT" },
+    }), true)
+    const output = (await result.json()).error
+    assert.equal(output.type, "quota_exhausted")
+    assert.equal(output.reset_at, "2026-11-12T12:29:21.500Z", String(retryDelay))
+  }
+  const error = quotaError({
+    message: "Quota pool exhausted. Resets in 0.125s.",
+    details: [null, "not a detail", { "@type": "type.googleapis.com/example.Other", retryDelay: "9s" }],
+  })
+  const output = await (await adaptResponse(new Response(JSON.stringify({ error }), {
+    status: 429, headers: { date: "Thu, 12 Nov 2026 11:27:18 GMT" },
+  }), false)).json()
+  assert.equal(output.error.reset_at, "2026-11-12T11:27:18.125Z")
+})
+
+test("uses the supplied current time when the HTTP Date is absent or invalid", async () => {
+  for (const date of [undefined, "not a date", "0", "Tue, 31 Feb 2026 00:00:00 GMT"]) {
+    const error = quotaError({ details: [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "1.5s" }] })
+    const headers = date === undefined ? {} : { date }
+    const result = await adaptResponse(new Response(JSON.stringify({ error }), { status: 429, headers }), false, {
+      now: () => 1794482838123,
+    })
+    assert.equal((await result.json()).error.reset_at, "2026-11-12T11:27:19.623Z")
+  }
+})
+
+test("reports exhaustion without inventing a reset for missing, malformed, or overflowing durations", async () => {
+  const messages = [
+    "Quota pool exhausted.",
+    "Quota pool exhausted. Resets in unknown.",
+    "Quota pool exhausted. Resets in -1s.",
+    "Quota pool exhausted. Resets in 0s.",
+    "Quota pool exhausted. Resets in 1s2m.",
+    "Quota pool exhausted. Resets in 2hgarbage.",
+    "Quota pool exhausted. Resets in 999999999999999999999999999999999999h.",
+  ]
+  for (const message of messages) {
+    const error = quotaError({ message, details: [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "Infinitys" }] })
+    const result = await adaptResponse(new Response(JSON.stringify({ error }), { status: 429 }), false, { now: () => 0 })
+    const output = (await result.json()).error
+    assert.equal(output.type, "quota_exhausted")
+    assert.equal(Object.hasOwn(output, "reset_at"), false, message)
+    assert.equal(Object.hasOwn(output, "retry_after_seconds"), false)
+    assert.equal(output.message.includes("预计"), false)
+    assert.match(output.message, /额度池.*耗尽.*等待.*管理员.*重新登录不会恢复额度/)
+  }
+  for (const now of [() => Infinity, () => 8640000000000000]) {
+    const result = await adaptResponse(new Response(JSON.stringify({ error: quotaError() }), { status: 429 }), false, { now })
+    assert.equal(Object.hasOwn((await result.json()).error, "reset_at"), false)
+  }
+})
+
+test("leaves ordinary HTTP 429 errors and their original headers and bytes intact", async () => {
+  const bodies = [
+    { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Quota exceeded" } },
+    { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "TooManyRequests: quota is temporarily limited" } },
+    { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Resource exhausted" } },
+    { message: quotaMessage },
+    { error: [quotaMessage] },
+  ]
+  for (const wantsStream of [false, true]) {
+    for (const body of bodies) {
+      const raw = JSON.stringify(body, null, 2)
+      const upstream = new Response(raw, { status: 429, headers: {
+        "content-type": "text/event-stream", "content-length": String(encoder.encode(raw).length),
+        "content-encoding": "gzip", "transfer-encoding": "chunked", "retry-after": "17", "x-request-id": "ordinary-429",
+      } })
+      const headers = [...upstream.headers]
+      const result = await adaptResponse(upstream, wantsStream)
+      assert.equal(result, upstream)
+      assert.equal(result.bodyUsed, false)
+      assert.deepEqual([...result.headers], headers)
+      assert.equal(await result.text(), raw)
+    }
+  }
+})
+
+test("requires HTTP 429 as well as the observed quota phrase", async () => {
+  for (const status of [200, 400, 403, 500]) {
+    for (const wantsStream of [false, true]) {
+      const raw = JSON.stringify({ error: quotaError() })
+      const upstream = new Response(raw, { status, headers: { "content-type": "application/json" } })
+      assert.equal(await adaptResponse(upstream, wantsStream), upstream)
+      assert.equal(await upstream.text(), raw)
+    }
+  }
+})
+
+test("preserves unrelated error fields and headers while discarding stale body metadata", async () => {
+  const details = [
+    { "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "QUOTA_EXHAUSTED", domain: "synthetic.example", metadata: { arbitrary: "preserved" } },
+    { "@type": "type.googleapis.com/example.Unrelated", nested: { value: [1, 2] } },
+  ]
+  const error = quotaError({ message: "Quota pool exhausted. Unrelated private diagnostic text.", details, extra: { original: true } })
+  const upstream = new Response(JSON.stringify({ error, request: "synthetic-request" }), { status: 429, headers: {
+    "content-type": "text/event-stream", "content-length": "1234", "content-encoding": "gzip", "transfer-encoding": "chunked",
+    "retry-after": "17", "x-request-id": "synthetic-request", "cache-control": "no-store",
+  } })
+  const result = await adaptResponse(upstream, false)
+  const output = await result.json()
+  assert.deepEqual(output.error.details, details)
+  assert.deepEqual(output.error.extra, { original: true })
+  assert.equal(output.request, "synthetic-request")
+  assert.equal(output.error.message.includes("private diagnostic"), false)
+  assert.equal(result.headers.get("content-type"), "application/json")
+  for (const name of ["content-length", "content-encoding", "transfer-encoding"]) assert.equal(result.headers.has(name), false)
+  assert.equal(result.headers.get("retry-after"), "17")
+  assert.equal(result.headers.get("x-request-id"), "synthetic-request")
+  assert.equal(result.headers.get("cache-control"), "no-store")
+})
+
+test("returns the original HTTP 429 response when its cloned body is not JSON", async () => {
+  for (const raw of ["", '{"error":broken}', "event: error\ndata: upstream rejected\n\n"]) {
+    const upstream = new Response(raw, { status: 429, headers: { "content-type": "text/event-stream", "x-request-id": "unparsed" } })
+    const result = await adaptResponse(upstream, true)
+    assert.equal(result, upstream)
+    assert.equal(result.headers.get("content-type"), "text/event-stream")
+    assert.equal(result.headers.get("x-request-id"), "unparsed")
+    assert.equal(await result.text(), raw)
+  }
+})
+
+test("honors cancellation while inspecting a declared SSE HTTP 429 JSON body", async () => {
+  for (const wantsStream of [false, true]) {
+    const abort = new AbortController()
+    let signalPull
+    const pulled = new Promise((resolve) => { signalPull = resolve })
+    let canceled = false
+    const upstream = new Response(new ReadableStream({
+      start(controller) { controller.enqueue(encoder.encode('{"error":')) },
+      pull() { signalPull() },
+      cancel() { canceled = true },
+    }), { status: 429, headers: { "content-type": "text/event-stream" } })
+    const pending = adaptResponse(upstream, wantsStream, { signal: abort.signal })
+    await pulled
+    const reason = new DOMException("Stopped quota inspection", "AbortError")
+    abort.abort(reason)
+    await assert.rejects(pending, (error) => error === reason)
+    assert.equal(canceled, true)
+  }
+})
+
+test("cancels HTTP 429 inspection before reading for an already aborted caller", async () => {
+  const abort = new AbortController()
+  const reason = new DOMException("Already stopped", "AbortError")
+  abort.abort(reason)
+  let cancellationReason
+  const upstream = new Response(new ReadableStream({ cancel(value) { cancellationReason = value } }), { status: 429 })
+  await assert.rejects(adaptResponse(upstream, true, { signal: abort.signal }), (error) => error === reason)
+  assert.equal(cancellationReason, reason)
+})
+
 test("passes direct SSE through without consuming or rewriting it", async () => {
   const raw = event({ candidates: [{ content: { parts: [{ text: "unchanged" }] } }] })
   const upstream = sseResponse(raw)
@@ -370,6 +592,31 @@ test("returns a Google error before any content as a non-success JSON response",
   assert.deepEqual(await result.json(), { error })
 })
 
+test("classifies an aggregated quota failure using its parsed error status", async () => {
+  for (const code of [429, undefined]) {
+    const error = quotaError()
+    if (code === undefined) delete error.code
+    const upstream = sseResponse(event({ candidates: [{ content: { parts: [{ text: "discard this partial answer" }] } }] }) + "event: error\n" + event({ error }))
+    upstream.headers.set("date", "Thu, 12 Nov 2026 11:27:18 GMT")
+    const result = await adaptResponse(upstream, false, { now: () => 0 })
+    assert.equal(result.status, 429)
+    assert.equal(result.headers.get("content-type"), "application/json")
+    assert.equal(result.headers.get("x-request-id"), "request-42")
+    const output = await result.json()
+    assert.equal(output.candidates, undefined)
+    assert.equal(output.error.code, code)
+    assert.equal(output.error.status, "RESOURCE_EXHAUSTED")
+    assert.equal(output.error.type, "quota_exhausted")
+    assert.equal(output.error.reset_at, "2026-11-18T09:40:57.277Z")
+    assert.deepEqual(output.error.details, error.details)
+    assert.match(output.error.message, /当前模型.*Quota pool exhausted/)
+  }
+  const error = quotaError({ code: 403 })
+  const result = await adaptResponse(sseResponse(event({ error })), false)
+  assert.equal(result.status, 403)
+  assert.deepEqual(await result.json(), { error })
+})
+
 test("discards partial content when a later Google error ends the stream and cancels upstream", async () => {
   const error = { code: 429, status: "RESOURCE_EXHAUSTED", message: "Quota exceeded", details: [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "5s" }] }
   let canceled = false
@@ -428,7 +675,7 @@ test("fails closed on malformed Google errors and named error payloads", async (
 })
 
 test("passes streamed error events through byte for byte without choosing a new status", async () => {
-  const raw = event({ candidates: [{ content: { parts: [{ text: "partial" }] } }] }) + "event: error\n" + event({ error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Quota exceeded" } })
+  const raw = event({ candidates: [{ content: { parts: [{ text: "partial" }] } }] }) + "event: error\n" + event({ error: quotaError() })
   const upstream = sseResponse(raw, [1])
   const result = await adaptResponse(upstream, true)
   assert.equal(result, upstream)
