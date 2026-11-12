@@ -107,6 +107,61 @@ test('preserves native fields and keeps caller license selection separate', asyn
   assert.equal(f.session.binding(result).length, 64);
 });
 
+test('renews native credentials without a tier display name and preserves their binding lineage', async () => {
+  const initial = native({ wif_provider: 'workforce-provider' });
+  delete initial.tier_display_name;
+  const f = fixture(initial, {
+    refresh: () => json({ access_token: 'renewed-workforce-access', refresh_token: 'rotated-workforce-refresh', expires_in: 3600 }),
+  });
+  const result = await f.session.profile({ forceRefresh: true });
+  const nativeBinding = f.session.binding(result);
+  const nextHost = f.freshSession();
+  const restored = await nextHost.profile({ config: { nativeBinding } });
+  const saved = f.value;
+  assert.equal(f.calls.oauthConfigs, 1);
+  assert.equal(f.calls.renewals, 1);
+  assert.equal(f.calls.commits, 1);
+  assert.equal(f.calls.userinfo, 0);
+  assert.deepEqual(f.calls.urls, ['https://sts.googleapis.com/v1/oauthtoken']);
+  assert.deepEqual(f.calls.forms[0], { grant_type: 'refresh_token', refresh_token: 'test-refresh' });
+  assert.deepEqual(saved, {
+    ...initial,
+    token: {
+      ...initial.token,
+      access_token: 'renewed-workforce-access',
+      refresh_token: 'rotated-workforce-refresh',
+      expiry: new Date(NOW + 3600_000).toISOString(),
+    },
+  });
+  for (const profile of [result, restored, saved]) {
+    assert.equal(Object.hasOwn(profile, 'tier_display_name'), false);
+    assert.equal(profile.writer_id, initial.writer_id);
+    assert.equal(profile.saved_wif_provider, initial.saved_wif_provider);
+    assert.deepEqual(profile.extra, initial.extra);
+    assert.deepEqual(profile.token, saved.token);
+  }
+  assert.equal(nextHost.binding(restored), nativeBinding);
+  assert.equal(result._principal, restored._principal);
+  assert.equal(f.principalMap.size, 2);
+  assert.deepEqual(new Set(f.principalMap.values()), new Set([result._principal]));
+});
+
+test('rejects supplied nonstring tier display names before OAuth', async t => {
+  for (const tier_display_name of [null, false, 0, {}, []]) {
+    await t.test(JSON.stringify(tier_display_name), async () => {
+      const f = fixture(native({ tier_display_name }));
+      const original = f.value;
+      await assert.rejects(f.session.profile({ forceRefresh: true }), { code: 'ERR_NATIVE_FORMAT' });
+      assert.equal(f.calls.oauthConfigs, 0);
+      assert.equal(f.calls.renewals, 0);
+      assert.equal(f.calls.userinfo, 0);
+      assert.equal(f.calls.commits, 0);
+      assert.equal(f.principalMap.size, 0);
+      assert.deepEqual(f.value, original);
+    });
+  }
+});
+
 test('refreshes only below the five-minute boundary', async () => {
   const f = fixture(native({ token: { ...native().token, expiry: new Date(NOW + 300_000).toISOString() } }));
   await f.session.profile();

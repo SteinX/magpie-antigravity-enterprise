@@ -66,9 +66,10 @@ function decode(raw) {
       if (typeof token[field] !== 'string' || !token[field]) throw new Error();
     }
     if (!Number.isFinite(Date.parse(token.expiry))) throw new Error();
-    for (const field of ['auth_method', 'wif_provider', 'project_id', 'region', 'user_tier', 'tier_display_name']) {
+    for (const field of ['auth_method', 'wif_provider', 'project_id', 'region', 'user_tier']) {
       if (typeof profile[field] !== 'string') throw new Error();
     }
+    if (Object.hasOwn(profile, 'tier_display_name') && typeof profile.tier_display_name !== 'string') throw new Error();
     effectiveRefreshMethod(profile);
     return { raw: text, profile };
   } catch (error) {
