@@ -43,13 +43,28 @@ function boundedMap(map, key, value) {
 }
 
 async function readJSON(response, operation) {
-  const result = await response.json().catch(() => null)
   if (!response.ok) {
-    const error = new Error(`${operation}: HTTP ${response.status}${result?.error?.message ? ` — ${result.error.message}` : ""}`)
-    if (response.status === 401) error.signIn = "expired"
-    throw error
+    await response.body?.cancel()
+    throw Object.assign(new Error(`${operation}: HTTP ${response.status}`), { signIn: response.status === 401 ? "expired" : "kept" })
   }
+  const result = await response.json().catch(() => null)
   if (!result || typeof result !== "object") throw new Error(`${operation}: invalid JSON response`)
+  return result
+}
+
+async function readResource(send, renew, signal, operation) {
+  signal.throwIfAborted()
+  let response = await send()
+  signal.throwIfAborted()
+  if (response.status === 401) {
+    await response.body?.cancel()
+    signal.throwIfAborted()
+    await renew()
+    signal.throwIfAborted()
+    response = await send()
+  }
+  const result = await readJSON(response, operation)
+  signal.throwIfAborted()
   return result
 }
 
@@ -82,30 +97,35 @@ export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => 
   const trajectories = new Map()
   const trajectoryCounters = new Map()
 
-  async function headersFor(profile, signal) {
+  async function headersFor(profile, signal, session = native) {
     signal?.throwIfAborted()
     return {
       Authorization: `Bearer ${profile.token.access_token}`,
       "Content-Type": "application/json",
-      "User-Agent": await native.identity(profile),
+      "User-Agent": await session.identity(profile),
     }
   }
 
-  async function licenses(profile, signal) {
-    const response = await fetch(`${BASE}:fetchLicenses`, {
-      headers: await headersFor(profile, signal), signal: requestSignal(signal),
-    })
-    const result = await readJSON(response, "Fetching enterprise licenses")
+  async function licenses(profile, session, config, signal) {
+    const binding = session.binding(profile)
+    const result = await readResource(async () => {
+      const headers = await headersFor(profile, signal, session)
+      signal.throwIfAborted()
+      return fetch(`${BASE}:fetchLicenses`, { headers, signal })
+    }, async () => {
+      profile = await session.profile({ signal, config, forceRefresh: true, interactive: true })
+      if (session.binding(profile) !== binding) throw authError("The account signed in to Antigravity changed. Sign in to this provider again to bind the intended account")
+    }, signal, "Fetching enterprise licenses")
     if (!Array.isArray(result.licenses)) throw new Error("The enterprise API returned no license list")
     return result.licenses
   }
 
-  async function signedIn(auth, signal, forceRefresh = false) {
+  async function signedIn(auth, signal, forceRefresh = false, session = native) {
     if (auth?.type !== "api" || !auth.metadata?.nativeBinding) throw authError("Sign in with the local Antigravity enterprise account first")
     const metadata = auth.metadata
     const target = validateTarget(metadata)
-    const profile = await native.profile({ signal, forceRefresh, config: metadata })
-    if (native.binding(profile) !== metadata.nativeBinding) {
+    const profile = await session.profile({ signal, forceRefresh, config: metadata, interactive: false })
+    if (session.binding(profile) !== metadata.nativeBinding) {
       throw authError("The account signed in to Antigravity changed. Sign in to this provider again to bind the intended account")
     }
     if (typeof metadata.userTier !== "string" || !metadata.userTier) throw authError("The saved account has no enterprise license. Sign in again and select its project and location")
@@ -144,29 +164,33 @@ export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => 
       const prompt = prompts.find((item) => !(item.key in inputs) && (!item.when || inputs[item.when.key] === item.when.value))
       if (!prompt) return null
       if (prompt.key === "projectId" || prompt.key === "location" || prompt.key === "wifProvider") {
-        const profile = await createSession(options).profile()
+        const profile = await createSession(options).profile({ interactive: true })
         const suggestion = prompt.key === "projectId" ? profile.project_id : prompt.key === "location" ? profile.region : profile.wif_provider
         return { ...prompt, placeholder: suggestion || prompt.placeholder }
       }
       return prompt
     },
     async authorize(inputs = {}, { signal } = {}) {
+      const boundedSignal = requestSignal(signal)
       try {
-        const target = validateTarget(inputs)
-        if (!["auto", "gcp", "wif"].includes(inputs.authMethod ?? "auto")) throw new Error("Choose a supported authentication method")
-        if (inputs.authMethod === "wif" && !inputs.wifProvider?.trim()) throw new Error("Enter your WIF provider")
-        const config = { ...target, authMethod: inputs.authMethod ?? "auto", wifProvider: inputs.wifProvider?.trim() ?? "" }
-        const signingNative = createSession(options)
-        const profile = await signingNative.profile({ signal, config })
-        const available = await licenses(profile, signal)
-        const license = available.find((item) => item.projectId === target.projectId && item.location === target.location)
-        if (!license?.userTier) throw new Error("This account has no enterprise license for that project and location. Check the values or select the intended account in Antigravity")
-        const binding = signingNative.binding(profile)
-        const metadata = { ...config, nativeBinding: binding, userTier: license.userTier, tierDisplayName: license.tierDisplayName || license.userTier }
-        native = signingNative
-        return { type: "success", key: `native-keychain:${binding}`, accountId: `${target.projectId}/${target.location}/${binding.slice(0, 12)}`, metadata }
+        return await withSignal(async () => {
+          const target = validateTarget(inputs)
+          if (!["auto", "gcp", "wif"].includes(inputs.authMethod ?? "auto")) throw new Error("Choose a supported authentication method")
+          if (inputs.authMethod === "wif" && !inputs.wifProvider?.trim()) throw new Error("Enter your WIF provider")
+          const config = { ...target, authMethod: inputs.authMethod ?? "auto", wifProvider: inputs.wifProvider?.trim() ?? "" }
+          const signingNative = createSession(options)
+          const profile = await signingNative.profile({ signal: boundedSignal, config, interactive: true })
+          boundedSignal.throwIfAborted()
+          const available = await licenses(profile, signingNative, config, boundedSignal)
+          const license = available.find((item) => item.projectId === target.projectId && item.location === target.location)
+          if (!license?.userTier) throw new Error("This account has no enterprise license for that project and location. Check the values or select the intended account in Antigravity")
+          const binding = signingNative.binding(profile)
+          const metadata = { ...config, nativeBinding: binding, userTier: license.userTier, tierDisplayName: license.tierDisplayName || license.userTier }
+          native = signingNative
+          return { type: "success", key: `native-keychain:${binding}`, accountId: `${target.projectId}/${target.location}/${binding.slice(0, 12)}`, metadata }
+        }, boundedSignal)
       } catch (error) {
-        if (signal?.aborted) throw error
+        boundedSignal.throwIfAborted()
         return { type: "failed", error: error.message }
       }
     },
@@ -186,16 +210,18 @@ export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => 
           return await withSignal(async () => {
             const auth = await getAuth()
             boundedSignal.throwIfAborted()
-            const { profile, target, metadata } = await signedIn(auth, boundedSignal)
-            const headers = await headersFor(profile, boundedSignal)
+            const session = native
+            let state = await signedIn(auth, boundedSignal, false, session)
+            const summary = await readResource(async () => {
+              const headers = await headersFor(state.profile, boundedSignal, session)
+              boundedSignal.throwIfAborted()
+              return fetch(QUOTA, {
+                method: "POST", headers, signal: boundedSignal,
+                body: JSON.stringify({ project: state.target.projectId }),
+              })
+            }, async () => { state = await signedIn(auth, boundedSignal, true, session) }, boundedSignal, "Fetching enterprise quota")
             boundedSignal.throwIfAborted()
-            const response = await fetch(QUOTA, {
-              method: "POST", headers, signal: boundedSignal,
-              body: JSON.stringify({ project: target.projectId }),
-            })
-            const summary = await readJSON(response, "Fetching enterprise quota")
-            boundedSignal.throwIfAborted()
-            return quotaUsage(summary, { metadata })
+            return quotaUsage(summary, { metadata: state.metadata })
           }, boundedSignal)
         } catch (error) {
           boundedSignal.throwIfAborted()
@@ -239,7 +265,7 @@ export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => 
               return await adaptResponse(response, match[2] === "streamGenerateContent", { signal })
             } catch (error) {
               if (signal?.aborted || error.name === "AbortError") throw error
-              return failed(error.message, error.signIn ? 401 : error instanceof SyntaxError ? 400 : 502, error.signIn)
+              return failed(error.message, error.signIn === "expired" ? 401 : error instanceof SyntaxError ? 400 : 502, error.signIn)
             }
           },
         }
@@ -247,14 +273,22 @@ export const AntigravityEnterprisePlugin = async (_input = {}, options = {}) => 
     },
     provider: {
       id: PROVIDER,
-      async models(_provider, { auth } = {}) {
+      async models(_provider, { auth, signal } = {}) {
         if (!auth?.metadata?.nativeBinding) return {}
-        const { profile, target, metadata } = await signedIn(auth)
-        const response = await fetch(CATALOG, {
-          method: "POST", headers: await headersFor(profile), signal: requestSignal(),
-          body: JSON.stringify({ project: target.projectId, location: target.location, entitlement: { userTier: metadata.userTier } }),
-        })
-        return catalogModels(await readJSON(response, "Fetching the enterprise model catalog"))
+        const boundedSignal = requestSignal(signal)
+        return withSignal(async () => {
+          const session = native
+          let state = await signedIn(auth, boundedSignal, false, session)
+          const result = await readResource(async () => {
+            const headers = await headersFor(state.profile, boundedSignal, session)
+            boundedSignal.throwIfAborted()
+            return fetch(CATALOG, {
+              method: "POST", headers, signal: boundedSignal,
+              body: JSON.stringify({ project: state.target.projectId, location: state.target.location, entitlement: { userTier: state.metadata.userTier } }),
+            })
+          }, async () => { state = await signedIn(auth, boundedSignal, true, session) }, boundedSignal, "Fetching the enterprise model catalog")
+          return catalogModels(result)
+        }, boundedSignal)
       },
     },
   }

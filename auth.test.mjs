@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { inspect } from 'node:util';
 import { createNativeSession } from './auth.mjs';
 import { CliMetadataError } from './cli-metadata.mjs';
+import { KeychainError } from './keychain.mjs';
 
 const NOW = Date.parse('2026-11-11T12:00:00Z');
 const encode = value => 'go-keyring-base64:' + Buffer.from(JSON.stringify(value)).toString('base64');
@@ -31,18 +32,20 @@ function fixture(initial = native(), options = {}) {
   let raw = encode(initial);
   let queue = Promise.resolve();
   const principalMap = new Map();
-  const calls = { reads: 0, commits: 0, oauthConfigs: 0, renewals: 0, userinfo: 0, urls: [], forms: [], headers: [], signals: [] };
+  const calls = { reads: 0, commits: 0, oauthConfigs: 0, renewals: 0, userinfo: 0, urls: [], forms: [], headers: [], signals: [], readPolicies: [], lockPolicies: [], commitPolicies: [] };
   const deps = {
     now: () => NOW,
     metadata: async () => ({ version: '1.5.5', cl: '1017970541', platform: 'darwin', arch: 'arm64' }),
-    readCredential: async ({ signal } = {}) => {
+    readCredential: async ({ signal, interactive } = {}) => {
       calls.reads++;
+      calls.readPolicies.push(interactive);
       if (signal?.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       return raw;
     },
     readPrincipal: async key => principalMap.get(key),
     writePrincipal: async (key, value) => { principalMap.set(key, value); },
-    withRefreshLock: async (work, signal) => {
+    withRefreshLock: async (work, signal, { interactive } = {}) => {
+      calls.lockPolicies.push(interactive);
       const previous = queue;
       const released = deferred();
       queue = released.promise;
@@ -52,6 +55,7 @@ function fixture(initial = native(), options = {}) {
         return await work({ commit: async (expected, replacement) => {
           await options.beforeCommit?.();
           if (raw !== expected) return false;
+          calls.commitPolicies.push(interactive);
           calls.commits++;
           raw = replacement;
           return true;
@@ -236,11 +240,13 @@ test('shares one renewal while one waiting consumer cancels', async () => {
   assert.equal(f.calls.commits, 1);
 });
 
-test('last consumer cancellation aborts a pending renewal without saving', async () => {
+test('retains ownership after dispatch when the last consumer cancels', async () => {
   const entered = deferred();
-  const f = fixture(native(), { refresh: async (_url, request) => {
+  const finish = deferred();
+  const f = fixture(native(), { refresh: async () => {
     entered.resolve();
-    await new Promise((_resolve, reject) => request.signal.addEventListener('abort', () => reject(Object.assign(new Error('private detail'), { name: 'AbortError' })), { once: true }));
+    await finish.promise;
+    return json({ access_token: 'dispatched-access', refresh_token: 'dispatched-rotation', expires_in: 3600 });
   } });
   const cancel = new AbortController();
   const pending = f.session.profile({ forceRefresh: true, signal: cancel.signal });
@@ -248,8 +254,12 @@ test('last consumer cancellation aborts a pending renewal without saving', async
   await entered.promise;
   cancel.abort();
   await rejected;
-  assert.equal(f.calls.signals[0].aborted, true);
-  assert.equal(f.calls.commits, 0);
+  assert.equal(f.calls.signals[0].aborted, false);
+  const remaining = f.freshSession().profile({ forceRefresh: true });
+  finish.resolve();
+  assert.equal((await remaining).token.refresh_token, 'dispatched-rotation');
+  assert.equal(f.calls.renewals, 1);
+  assert.equal(f.calls.commits, 1);
 });
 
 test('passes cancellation to direct native keychain reads', async () => {
@@ -566,4 +576,154 @@ test('marks revoked authorization for rebind while retaining transient failure s
     });
     assert.equal(f.calls.commits, 0);
   }
+});
+
+test('background Keychain access failures retain sign-in and redact attached process details', async () => {
+  for (const kind of ['interaction', 'denied', 'cancelled']) {
+    const f = fixture();
+    const secret = 'synthetic-private-process-output';
+    f.deps.readCredential = async ({ interactive }) => {
+      assert.equal(interactive, false);
+      throw Object.assign(new KeychainError(kind), { stdout: secret, stderr: secret, cause: new Error(secret) });
+    };
+    await assert.rejects(f.freshSession().profile(), error => {
+      assert.equal(error.code, 'ERR_NATIVE_KEYCHAIN_ACCESS');
+      assert.equal(error.signIn, undefined);
+      assert.equal(error.kind, kind);
+      assert.equal(error.stdout, undefined);
+      assert.equal(error.stderr, undefined);
+      assert.equal(error.cause, undefined);
+      assert.equal(inspect(error, { depth: null }).includes(secret), false);
+      return true;
+    });
+    assert.equal(f.calls.renewals, 0);
+    assert.equal(f.calls.commits, 0);
+  }
+});
+
+test('only a missing Keychain item expires sign-in', async () => {
+  const f = fixture();
+  f.deps.readCredential = async () => { throw new KeychainError('missing'); };
+  await assert.rejects(f.freshSession().profile(), { code: 'ERR_NATIVE_KEYCHAIN_MISSING', signIn: 'expired' });
+  assert.equal(f.calls.renewals, 0);
+});
+
+test('explicit interaction authorizes every renewal read and guarded commit without persisting its policy', async () => {
+  const f = fixture();
+  const originalRead = f.deps.readCredential;
+  f.deps.readCredential = request => {
+    if (!request.interactive) throw new KeychainError('interaction');
+    return originalRead(request);
+  };
+  const session = f.freshSession();
+  await assert.rejects(session.profile({ forceRefresh: true }), { code: 'ERR_NATIVE_KEYCHAIN_ACCESS' });
+  const result = await session.profile({ forceRefresh: true, interactive: true });
+  assert.equal(result.token.access_token, 'renewed-access-1');
+  assert.deepEqual(f.calls.readPolicies, [true, true, true]);
+  assert.deepEqual(f.calls.lockPolicies, [true]);
+  assert.deepEqual(f.calls.commitPolicies, [true]);
+  await assert.rejects(session.profile(), { code: 'ERR_NATIVE_KEYCHAIN_ACCESS' });
+  assert.equal(f.calls.renewals, 1);
+});
+
+test('background renewals cannot join an interactive flight to bypass denied write access', async () => {
+  const entered = deferred();
+  const finish = deferred();
+  const f = fixture(native(), { refresh: async () => {
+    entered.resolve();
+    await finish.promise;
+    return json({ access_token: 'interactive-renewed', expires_in: 3600 });
+  } });
+  const originalLock = f.deps.withRefreshLock;
+  f.deps.withRefreshLock = (work, signal, policy) => {
+    if (!policy.interactive) throw new KeychainError('denied');
+    return originalLock(work, signal, policy);
+  };
+  const session = f.freshSession();
+  const explicit = session.profile({ forceRefresh: true, interactive: true });
+  await entered.promise;
+  try {
+    await assert.rejects(session.profile({ forceRefresh: true }), { code: 'ERR_NATIVE_KEYCHAIN_ACCESS' });
+  } finally { finish.resolve(); }
+  assert.equal((await explicit).token.access_token, 'interactive-renewed');
+  assert.equal(f.calls.renewals, 1);
+  assert.deepEqual(f.calls.commitPolicies, [true]);
+});
+
+test('independent interaction policies still serialize and recognize the committed account rotation', async () => {
+  const entered = deferred();
+  const finish = deferred();
+  const f = fixture(native({ token: { ...native().token, expiry: new Date(NOW - 1).toISOString() } }), { refresh: async () => {
+    entered.resolve();
+    await finish.promise;
+    return json({ access_token: 'cross-mode-access', refresh_token: 'cross-mode-rotation', expires_in: 3600 });
+  } });
+  const explicit = f.session.profile({ interactive: true });
+  await entered.promise;
+  const background = f.freshSession().profile();
+  finish.resolve();
+  const results = await Promise.all([explicit, background]);
+  assert.deepEqual(results.map(value => value.token.refresh_token), ['cross-mode-rotation', 'cross-mode-rotation']);
+  assert.equal(f.calls.renewals, 1);
+  assert.equal(f.calls.commits, 1);
+  assert.deepEqual(f.calls.lockPolicies, [true, false]);
+});
+
+test('cancellation before refresh dispatch prevents the network request and commit', async () => {
+  const entered = deferred();
+  const finish = deferred();
+  const released = deferred();
+  const f = fixture();
+  const originalConfig = f.deps.oauthConfig;
+  const originalLock = f.deps.withRefreshLock;
+  f.deps.oauthConfig = async profile => { entered.resolve(); await finish.promise; return originalConfig(profile); };
+  f.deps.withRefreshLock = (...args) => originalLock(...args).finally(() => released.resolve());
+  const cancel = new AbortController();
+  const pending = f.freshSession().profile({ forceRefresh: true, signal: cancel.signal });
+  const rejected = assert.rejects(pending, { name: 'AbortError' });
+  await entered.promise;
+  cancel.abort();
+  await rejected;
+  finish.resolve();
+  await released.promise;
+  assert.equal(f.calls.renewals, 0);
+  assert.equal(f.calls.commits, 0);
+});
+
+test('cancellation during response parsing still persists a server-rotated refresh token', async () => {
+  const parsing = deferred();
+  const finish = deferred();
+  const f = fixture(native(), { refresh: () => ({
+    ok: true,
+    async json() {
+      parsing.resolve();
+      await finish.promise;
+      return { access_token: 'parsed-access', refresh_token: 'parsed-rotation', expires_in: 3600 };
+    },
+  }) });
+  const cancel = new AbortController();
+  const pending = f.session.profile({ forceRefresh: true, signal: cancel.signal });
+  const rejected = assert.rejects(pending, { name: 'AbortError' });
+  await parsing.promise;
+  cancel.abort();
+  await rejected;
+  assert.equal(f.calls.signals[0].aborted, false);
+  const remaining = f.freshSession().profile({ forceRefresh: true });
+  finish.resolve();
+  assert.equal((await remaining).token.refresh_token, 'parsed-rotation');
+  assert.equal(f.calls.renewals, 1);
+  assert.equal(f.calls.commits, 1);
+});
+
+test('a denied guarded commit retains actionable access error and preserves the native value', async () => {
+  const f = fixture(native(), { beforeCommit: () => { throw new KeychainError('denied'); } });
+  const original = f.value;
+  await assert.rejects(f.session.profile({ forceRefresh: true }), error => {
+    assert.equal(error.code, 'ERR_NATIVE_KEYCHAIN_ACCESS');
+    assert.equal(error.signIn, undefined);
+    assert.match(error.message, /Reconnect explicitly/);
+    return true;
+  });
+  assert.equal(f.calls.commits, 0);
+  assert.deepEqual(f.value, original);
 });

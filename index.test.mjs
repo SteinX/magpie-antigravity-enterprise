@@ -22,6 +22,7 @@ async function fixture(t, responses = [sse()], { binding = "native-account", onR
   const native = {
     async profile(options) {
       profiles.push(options)
+      assert.notEqual(options.interactive, true, "Background work must not request Keychain UI")
       options.signal?.throwIfAborted()
       return { token: { access_token: options.forceRefresh ? "renewed-access" : "native-access" } }
     },
@@ -459,16 +460,51 @@ test("quota usage reports missing auth and account binding changes as expired wi
   assert.equal(f.requests.length, 0)
 })
 
-test("quota read 401 expires auth while 403 preserves it without refreshing or fake usage", async (t) => {
-  for (const status of [401, 403]) {
-    const f = await fixture(t, [json({ error: { message: "Sign in again to access this quota resource" } }, status)])
-    const result = await f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider)
-    assert.equal(result.signIn, status === 401 ? "expired" : "kept")
-    assert.match(result.error, new RegExp(`HTTP ${status}`))
-    assert.equal(Object.hasOwn(result, "windows"), false)
-    assert.equal(f.requests.length, 1)
-    assert.deepEqual(f.profiles.map((options) => options.forceRefresh), [false])
+test("quota renews a rejected token once and returns real usage for the saved account", async (t) => {
+  const rejected = json({ error: { message: "private rejected-token detail" } }, 401)
+  const f = await fixture(t, [rejected, json(quotaSummary)])
+  const profile = f.native.profile
+  f.native.profile = async (options) => {
+    if (options.forceRefresh) assert.equal(rejected.bodyUsed, true)
+    return profile(options)
   }
+  const result = await f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider)
+  assert.equal(result.plan, "licensed-tier")
+  assert.notEqual(result.signIn, "expired")
+  assert.equal(Object.hasOwn(result, "error"), false)
+  assert.deepEqual(result.windows.map(({ used, models }) => ({ used, models })), [
+    { used: 100, models: ["gemini-3.8-flash-low"] },
+    { used: 0, models: ["claude-sonnet-4-5"] },
+  ])
+  assert.equal(f.requests.length, 2)
+  assert.deepEqual(f.requests.map((request) => request.payload), [{ project: "licensed-project" }, { project: "licensed-project" }])
+  assert.deepEqual(f.requests.map((request) => request.headers.get("authorization")), ["Bearer native-access", "Bearer renewed-access"])
+  assert.deepEqual(f.profiles.map((options) => options.forceRefresh), [false, true])
+  assert.ok(f.profiles.every((options) => options.config === f.metadata && options.signal === f.requests[0].signal))
+})
+
+test("a second quota 401 expires auth after exactly one renewal without exposing its body", async (t) => {
+  const secret = "private credential detail"
+  const f = await fixture(t, [json({ error: { message: secret } }, 401), json({ error: { message: secret } }, 401)])
+  const result = await f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider)
+  assert.equal(result.signIn, "expired")
+  assert.match(result.error, /HTTP 401/)
+  assert.equal(result.error.includes(secret), false)
+  assert.equal(Object.hasOwn(result, "windows"), false)
+  assert.equal(f.requests.length, 2)
+  assert.deepEqual(f.profiles.map((options) => options.forceRefresh), [false, true])
+})
+
+test("quota 403 preserves auth without refreshing, replaying, or exposing its body", async (t) => {
+  const secret = "private administrator detail"
+  const f = await fixture(t, [json({ error: { message: secret } }, 403)])
+  const result = await f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider)
+  assert.equal(result.signIn, "kept")
+  assert.match(result.error, /HTTP 403/)
+  assert.equal(result.error.includes(secret), false)
+  assert.equal(Object.hasOwn(result, "windows"), false)
+  assert.equal(f.requests.length, 1)
+  assert.deepEqual(f.profiles.map((options) => options.forceRefresh), [false])
 })
 
 test("quota network, JSON, and structural failures preserve auth and unknown usage", async (t) => {
@@ -604,4 +640,239 @@ test("quota cancellation covers a response body that has not finished parsing", 
   controller.abort()
   await assert.rejects(result, { name: "AbortError" })
   source.error(new DOMException("Response aborted", "AbortError"))
+})
+
+test("cancelling quota during forced renewal prevents a replay even when credentials arrive later", async (t) => {
+  const rejected = json({ error: { message: "Expired token" } }, 401)
+  const f = await fixture(t, [rejected])
+  const pendingProfile = deferred()
+  const enteredRenewal = deferred()
+  const profile = f.native.profile
+  f.native.profile = (options) => {
+    if (!options.forceRefresh) return profile(options)
+    assert.equal(rejected.bodyUsed, true)
+    enteredRenewal.resolve(options)
+    return pendingProfile.promise
+  }
+  const controller = new AbortController()
+  const result = f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider, { signal: controller.signal })
+  const renewal = await enteredRenewal.promise
+  assert.equal(renewal.signal, f.requests[0].signal)
+  const reason = new Error("Cancelled quota renewal")
+  controller.abort(reason)
+  await assert.rejects(result, (error) => error === reason)
+  pendingProfile.resolve({ token: { access_token: "late-token" } })
+  await pendingProfile.promise
+  await Promise.resolve()
+  assert.equal(f.requests.length, 1)
+})
+
+test("quota retry shares the original deadline through renewal and its second request", async (t) => {
+  const deadline = new AbortController()
+  const delays = []
+  t.mock.method(AbortSignal, "timeout", (milliseconds) => { delays.push(milliseconds); return deadline.signal })
+  const pendingResponse = deferred()
+  const replayed = deferred()
+  const f = await fixture(t, [json({}, 401), pendingResponse.promise], { onRequest(request) {
+    if (request.headers.get("authorization") === "Bearer renewed-access") replayed.resolve()
+  } })
+  const result = f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider)
+  await replayed.promise
+  assert.deepEqual(delays, [30_000])
+  assert.equal(f.requests.length, 2)
+  assert.ok(f.requests.every((request) => request.signal === deadline.signal))
+  assert.ok(f.profiles.every((options) => options.signal === deadline.signal))
+  const reason = new DOMException("Quota retry deadline exceeded", "TimeoutError")
+  deadline.abort(reason)
+  await assert.rejects(result, (error) => error === reason)
+  pendingResponse.resolve(json(quotaSummary))
+})
+
+test("quota renewal rejects an account switch before replaying the selected project's request", async (t) => {
+  const f = await fixture(t, [json({}, 401)])
+  const profile = f.native.profile
+  f.native.profile = async (options) => ({ ...await profile(options), account: options.forceRefresh ? "other-account" : "native-account" })
+  f.native.binding = (profile) => profile.account
+  const result = await f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider)
+  assert.equal(result.signIn, "expired")
+  assert.match(result.error, /account signed in to Antigravity changed/)
+  assert.equal(f.requests.length, 1)
+  assert.deepEqual(f.profiles.map((options) => options.forceRefresh), [false, true])
+})
+
+test("the model catalog renews once using the saved project's location and license tier", async (t) => {
+  const rejected = json({}, 401)
+  const f = await fixture(t, [rejected, json({ models: { "licensed-model": { displayName: "Licensed model", maxTokens: 1000 } } })])
+  const models = await f.plugin.provider.models({}, { auth: { type: "api", metadata: f.metadata } })
+  assert.deepEqual(Object.keys(models), ["licensed-model"])
+  assert.equal(models["licensed-model"].name, "Licensed model")
+  assert.equal(models["licensed-model"].limit.context, 1000)
+  assert.equal(rejected.bodyUsed, true)
+  assert.equal(f.requests.length, 2)
+  assert.ok(f.requests.every((request) => request.url === "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"))
+  assert.deepEqual(f.requests.map((request) => request.payload), [
+    { project: "licensed-project", location: "eu", entitlement: { userTier: "licensed-tier" } },
+    { project: "licensed-project", location: "eu", entitlement: { userTier: "licensed-tier" } },
+  ])
+  assert.deepEqual(f.requests.map((request) => request.headers.get("authorization")), ["Bearer native-access", "Bearer renewed-access"])
+  assert.deepEqual(f.profiles.map((options) => options.forceRefresh), [false, true])
+  assert.ok(f.profiles.every((options) => options.config === f.metadata && options.signal === f.requests[0].signal))
+})
+
+test("catalog authorization failures stop after the permitted renewal without exposing response bodies", async (t) => {
+  for (const status of [401, 403]) {
+    const secret = "private catalog authorization detail"
+    const responses = Array.from({ length: status === 401 ? 2 : 1 }, () => json({ error: { message: secret } }, status))
+    const f = await fixture(t, responses)
+    await assert.rejects(f.plugin.provider.models({}, { auth: { type: "api", metadata: f.metadata } }), (error) => {
+      assert.match(error.message, new RegExp(`HTTP ${status}`))
+      assert.equal(error.message.includes(secret), false)
+      assert.equal(error.signIn, status === 401 ? "expired" : "kept")
+      return true
+    })
+    assert.equal(f.requests.length, responses.length)
+    assert.deepEqual(f.profiles.map((options) => options.forceRefresh), status === 401 ? [false, true] : [false])
+  }
+})
+
+test("catalog renewal rejects a changed account before replaying its entitlement", async (t) => {
+  const f = await fixture(t, [json({}, 401)])
+  const profile = f.native.profile
+  f.native.profile = async (options) => ({ ...await profile(options), account: options.forceRefresh ? "other-account" : "native-account" })
+  f.native.binding = (profile) => profile.account
+  await assert.rejects(f.plugin.provider.models({}, { auth: { type: "api", metadata: f.metadata } }), (error) => error.signIn === "expired" && /account signed in to Antigravity changed/.test(error.message))
+  assert.equal(f.requests.length, 1)
+})
+
+async function signInFixture(responses, { renewedBinding = "signing-account" } = {}) {
+  const sessions = []
+  const profiles = []
+  const requests = []
+  const createNativeSession = () => {
+    const owner = sessions.length
+    let unlocked = owner === 0
+    const session = {
+      async profile(options = {}) {
+        profiles.push({ owner, ...options })
+        options.signal?.throwIfAborted()
+        if (!unlocked && !options.interactive) throw new Error("Explicit Keychain access is required")
+        unlocked = true
+        return {
+          owner, account: owner === 0 ? "previous-account" : options.forceRefresh ? renewedBinding : "signing-account",
+          project_id: "licensed-project", region: "eu",
+          token: { access_token: `${options.forceRefresh ? "renewed" : "native"}-${owner}` },
+        }
+      },
+      binding: (profile) => profile.account,
+      async identity(profile) {
+        assert.equal(profile.owner, owner, "The signing account's session must build its own identity")
+        return `antigravity/account-${owner}`
+      },
+    }
+    sessions.push(session)
+    return session
+  }
+  const fetch = async (url, init) => {
+    requests.push({ url, ...init, headers: new Headers(init.headers) })
+    const response = responses[requests.length - 1]
+    assert.ok(response, "An unexpected sign-in request was made")
+    return response
+  }
+  const plugin = await AntigravityEnterprisePlugin({}, { _deps: { createNativeSession, fetch } })
+  return { plugin, method: plugin.auth.methods[0], sessions, profiles, requests }
+}
+
+test("explicit login can unlock Keychain and renew licenses with its own account session", async () => {
+  const rejected = json({}, 401)
+  const f = await signInFixture([rejected, json({ licenses: [
+    { projectId: "other-project", location: "eu", userTier: "unrelated-tier" },
+    { projectId: "licensed-project", location: "eu", userTier: "selected-tier", tierDisplayName: "Selected enterprise" },
+  ] }), json({ models: { "signed-in-model": { displayName: "Signed in model" } } })])
+  const prompt = await f.method.ask()
+  assert.equal(prompt.key, "projectId")
+  assert.equal(prompt.placeholder, "licensed-project")
+  const result = await f.method.authorize({ projectId: "licensed-project", location: "eu", authMethod: "auto" })
+  assert.equal(result.type, "success")
+  assert.equal(result.key, "native-keychain:signing-account")
+  assert.equal(result.metadata.nativeBinding, "signing-account")
+  assert.equal(result.metadata.userTier, "selected-tier")
+  assert.equal(result.metadata.tierDisplayName, "Selected enterprise")
+  assert.equal(rejected.bodyUsed, true)
+  assert.deepEqual(f.requests.map((request) => request.headers.get("authorization")), ["Bearer native-2", "Bearer renewed-2"])
+  assert.ok(f.requests.every((request) => request.url.endsWith(":fetchLicenses") && request.headers.get("user-agent") === "antigravity/account-2"))
+  assert.deepEqual(f.profiles.filter((options) => options.owner === 2).map((options) => [options.forceRefresh ?? false, options.interactive]), [[false, true], [true, true]])
+  const models = await f.plugin.provider.models({}, { auth: { type: "api", metadata: result.metadata } })
+  assert.deepEqual(Object.keys(models), ["signed-in-model"])
+  assert.equal(f.requests[2].headers.get("user-agent"), "antigravity/account-2")
+  assert.equal(f.profiles.at(-1).interactive, false)
+})
+
+test("license renewal cannot bind a different native account or an unrelated project and location", async () => {
+  for (const [renewedBinding, license, message] of [
+    ["other-account", { projectId: "licensed-project", location: "eu", userTier: "tier" }, /account signed in to Antigravity changed/],
+    ["signing-account", { projectId: "other-project", location: "eu", userTier: "tier" }, /no enterprise license/],
+    ["signing-account", { projectId: "licensed-project", location: "us", userTier: "tier" }, /no enterprise license/],
+  ]) {
+    const f = await signInFixture([json({}, 401), json({ licenses: [license] })], { renewedBinding })
+    const result = await f.method.authorize({ projectId: "licensed-project", location: "eu", authMethod: "auto" })
+    assert.equal(result.type, "failed")
+    assert.match(result.error, message)
+    assert.equal(f.requests.length, renewedBinding === "other-account" ? 1 : 2)
+    assert.deepEqual(f.profiles.map((options) => options.forceRefresh ?? false), [false, true])
+  }
+})
+
+test("license 401 renews only once and license 403 never renews or exposes private error detail", async () => {
+  for (const status of [401, 403]) {
+    const secret = "private license authorization detail"
+    const responses = Array.from({ length: status === 401 ? 2 : 1 }, () => json({ error: { message: secret } }, status))
+    const f = await signInFixture(responses)
+    const result = await f.method.authorize({ projectId: "licensed-project", location: "eu", authMethod: "auto" })
+    assert.equal(result.type, "failed")
+    assert.match(result.error, new RegExp(`HTTP ${status}`))
+    assert.equal(result.error.includes(secret), false)
+    assert.equal(f.requests.length, responses.length)
+    assert.deepEqual(f.profiles.map((options) => options.forceRefresh ?? false), status === 401 ? [false, true] : [false])
+  }
+})
+
+test("cancelling quota while discarding its first 401 body prevents renewal and replay", async (t) => {
+  const discarding = deferred()
+  const pendingDiscard = deferred()
+  const rejected = new Response(new ReadableStream({
+    cancel() { discarding.resolve(); return pendingDiscard.promise },
+  }), { status: 401 })
+  const f = await fixture(t, [rejected])
+  const controller = new AbortController()
+  const result = f.plugin.auth.usage(async () => ({ type: "api", metadata: f.metadata }), quotaProvider, { signal: controller.signal })
+  await discarding.promise
+  assert.equal(f.profiles.length, 1)
+  const reason = new Error("Cancelled while discarding rejected quota response")
+  controller.abort(reason)
+  await assert.rejects(result, (error) => error === reason)
+  pendingDiscard.resolve()
+  await pendingDiscard.promise
+  await Promise.resolve()
+  assert.equal(f.profiles.length, 1)
+  assert.equal(f.requests.length, 1)
+})
+
+test("generation preserves sign-in when Keychain access is denied during lookup or renewal", async (t) => {
+  for (const deniedAt of ["lookup", "renewal"]) {
+    const rejected = json({}, 401)
+    const f = await fixture(t, deniedAt === "renewal" ? [rejected] : [])
+    const profile = f.native.profile
+    f.native.profile = (options) => {
+      if ((options.forceRefresh ? "renewal" : "lookup") === deniedAt) {
+        throw Object.assign(new Error("Keychain access was denied"), { signIn: "kept" })
+      }
+      return profile(options)
+    }
+    const response = await f.fetch(endpoint, { method: "POST", body: JSON.stringify(inputBody) })
+    assert.equal(response.status, 502)
+    assert.equal(response.headers.get("x-magpie-sign-in"), "kept")
+    assert.match((await response.json()).error.message, /Keychain access was denied/)
+    assert.equal(f.requests.length, deniedAt === "renewal" ? 1 : 0)
+    if (deniedAt === "renewal") assert.equal(rejected.bodyUsed, true)
+  }
 })

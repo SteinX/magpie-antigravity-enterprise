@@ -1,12 +1,11 @@
-import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, readFile, rename, stat, writeFile, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { CliMetadataError, readCliMetadata } from './cli-metadata.mjs';
 import { nativeFetch } from './transport.mjs';
+import { KeychainError, readCredential, withRefreshLock } from './keychain.mjs';
 
 const APP = '/Applications/Antigravity.app';
 const PREFIX = 'go-keyring-base64:';
@@ -18,7 +17,6 @@ const WIF_CLIENT = 'a2a6f0e3e-3ff0-462b-869a-47277df4c806';
 const CLOUD_SECRET_HASH = 'a2ddedc84850a9c48b7e01d61700848083bf0e10fb8d6c99c496803e8b48ced0';
 const flights = new Map();
 const clientCache = new Map();
-const helperBuilds = new Map();
 
 class NativeAuthError extends Error {
   constructor(code, message) {
@@ -35,28 +33,10 @@ const checkAbort = signal => { if (signal?.aborted) throw aborted(); };
 const tokenSnapshot = profile => hash(JSON.stringify(profile.token));
 const providerKey = profile => JSON.stringify([profile.auth_method, profile.wif_provider]);
 const tokenKey = profile => hash(JSON.stringify([profile.auth_method, profile.wif_provider, profile.token.refresh_token]));
-const publicError = error => error instanceof NativeAuthError || error instanceof CliMetadataError || error?.name === 'AbortError'
-  ? (error?.name === 'AbortError' ? aborted() : error)
-  : failure('ERR_NATIVE_AUTH', 'Native authentication failed; no credential details were recorded.');
-
-function run(file, args, { signal, input, timeout = 30_000 } = {}) {
-  checkAbort(signal);
-  return new Promise((resolve, reject) => {
-    const child = execFile(file, args, { encoding: 'utf8', signal, timeout, maxBuffer: 2 * 1024 * 1024 }, (error, stdout) => {
-      if (error) {
-        if (signal?.aborted) reject(aborted());
-        else if (file === '/usr/bin/security' && error.code === 44) {
-          const missing = failure('ERR_NATIVE_KEYCHAIN_MISSING', 'Sign in to the enterprise account in Antigravity before connecting.');
-          missing.signIn = 'expired';
-          reject(missing);
-        } else reject(failure('ERR_NATIVE_COMMAND', 'A native authentication command failed.'));
-      } else resolve(stdout);
-    });
-    // Never attach subprocess errors, stderr, input, or command output to errors.
-    child.stdin?.on('error', () => {});
-    child.stdin?.end(input);
-  });
-}
+const publicError = error => error instanceof KeychainError ? new KeychainError(error.kind)
+  : error instanceof NativeAuthError || error instanceof CliMetadataError || error?.name === 'AbortError'
+    ? (error?.name === 'AbortError' ? aborted() : error)
+    : failure('ERR_NATIVE_AUTH', 'Native authentication failed; no credential details were recorded.');
 
 function effectiveRefreshMethod(profile) {
   if (!['gcp', 'wif', 'business_licensed_enterprise'].includes(profile.auth_method)) {
@@ -152,91 +132,6 @@ async function installedClientConfig(appPath, profile) {
   return { url: 'https://oauth2.googleapis.com/token', clientId: CLOUD_CLIENT, clientSecret: native.cloudSecret, authStyle: 'form' };
 }
 
-async function helperExecutable(stateDir) {
-  const sourcePath = fileURLToPath(new URL('./keychain-helper.swift', import.meta.url));
-  const source = await readFile(sourcePath);
-  const buildKey = hash(source);
-  const destination = join(stateDir, `keychain-helper-${buildKey}`);
-  let pending = helperBuilds.get(destination);
-  if (!pending) {
-    pending = (async () => {
-      await mkdir(stateDir, { recursive: true, mode: 0o700 });
-      try { await stat(destination); return destination; } catch (error) { if (error.code !== 'ENOENT') throw error; }
-      const temporary = `${destination}.${randomUUID()}`;
-      try {
-        await run('/usr/bin/xcrun', ['swiftc', '-O', sourcePath, '-o', temporary], { timeout: 120_000 });
-        await rename(temporary, destination);
-      } finally {
-        await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; });
-      }
-      return destination;
-    })();
-    helperBuilds.set(destination, pending);
-    pending.catch(() => helperBuilds.delete(destination));
-  }
-  return pending;
-}
-
-function waitFor(promise, signal) {
-  checkAbort(signal);
-  if (!signal) return promise;
-  return new Promise((resolve, reject) => {
-    const onAbort = () => { cleanup(); reject(aborted()); };
-    const cleanup = () => signal.removeEventListener('abort', onAbort);
-    signal.addEventListener('abort', onAbort, { once: true });
-    promise.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
-    if (signal.aborted) onAbort();
-  });
-}
-
-async function withNativeLock(stateDir, task, signal) {
-  const executable = await waitFor(helperExecutable(stateDir), signal);
-  checkAbort(signal);
-  let child;
-  let announce;
-  let failReady;
-  const ready = new Promise((resolve, reject) => { announce = resolve; failReady = reject; });
-  const finished = new Promise((resolve, reject) => {
-    child = execFile(executable, [join(stateDir, 'refresh.lock')], {
-      encoding: 'utf8', signal, timeout: 120_000, maxBuffer: 1024,
-    }, (error, stdout) => {
-      if (error) {
-        const safe = signal?.aborted ? aborted() : failure('ERR_NATIVE_KEYCHAIN', 'The guarded native Keychain operation failed.');
-        failReady(safe);
-        reject(safe);
-      } else if (!stdout.startsWith('locked\n')) {
-        const safe = failure('ERR_NATIVE_KEYCHAIN', 'The native refresh lock could not be acquired.');
-        failReady(safe);
-        reject(safe);
-      } else resolve(stdout);
-    });
-    let output = '';
-    child.stdout.on('data', chunk => {
-      output += chunk;
-      if (output.startsWith('locked\n')) announce();
-    });
-    child.stdin.on('error', () => {});
-  });
-  // The child owns an OS flock, released on exit even after a host crash.
-  finished.catch(() => {});
-  let committed = false;
-  try {
-    await ready;
-    return await task({
-      async commit(expected, replacement) {
-        committed = true;
-        child.stdin.end(JSON.stringify({ expected, replacement }) + '\n');
-        const output = await finished;
-        if (output === 'locked\nchanged\n') return false;
-        if (output !== 'locked\nsaved\n') throw failure('ERR_NATIVE_KEYCHAIN', 'The native Keychain update did not complete.');
-        return true;
-      },
-    });
-  } finally {
-    if (!committed) child.stdin.end('\n');
-    await finished;
-  }
-}
 
 function subscribe(flight, signal) {
   checkAbort(signal);
@@ -279,8 +174,8 @@ export function createNativeSession(options = {}) {
   const deps = {
     now: Date.now,
     fetch: nativeFetch,
-    readCredential: ({ signal } = {}) => run('/usr/bin/security', ['find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w'], { signal }),
-    withRefreshLock: (task, signal) => withNativeLock(stateDir, task, signal),
+    readCredential: request => readCredential(stateDir, request),
+    withRefreshLock: (task, signal, policy) => withRefreshLock(stateDir, task, signal, policy),
     metadata: () => readCliMetadata(options.cliPath),
     oauthConfig: profile => installedClientConfig(appPath, profile),
     async readPrincipal(key) {
@@ -305,7 +200,7 @@ export function createNativeSession(options = {}) {
   };
   let pinnedBinding;
   const principals = new Map();
-  const read = async signal => decode(await deps.readCredential({ signal }));
+  const read = async (signal, interactive = false) => decode(await deps.readCredential({ signal, interactive }));
   const cachedPrincipal = async profile => {
     const key = tokenKey(profile);
     let principal = principals.get(key);
@@ -353,14 +248,16 @@ export function createNativeSession(options = {}) {
     return actual;
   };
 
-  async function renew(initial, forceRefresh, signal, config) {
-    const flightKey = `${stateDir}:${tokenKey(initial.profile)}`;
+  async function renew(initial, forceRefresh, signal, config, interactive) {
+    // A background consumer must never inherit an explicit sign-in's UI policy.
+    // Different policies still serialize their rotations through the native flock.
+    const flightKey = `${stateDir}:${tokenKey(initial.profile)}:${interactive ? 'interactive' : 'noninteractive'}`;
     let flight = flights.get(flightKey);
     if (!flight || flight.controller.signal.aborted) {
       flight = { controller: new AbortController(), consumers: 0, critical: false, settled: false };
       const own = flight;
       own.promise = deps.withRefreshLock(async lock => {
-        const current = await read(own.controller.signal);
+        const current = await read(own.controller.signal, interactive);
         validateConfig(current.profile, config);
         if (providerKey(current.profile) !== providerKey(initial.profile)) {
           throw failure('ERR_NATIVE_ACCOUNT_CHANGED', 'Native authentication changed while waiting for token renewal.');
@@ -392,6 +289,11 @@ export function createNativeSession(options = {}) {
         }
         form.set('grant_type', 'refresh_token');
         form.set('refresh_token', current.profile.token.refresh_token);
+        // Once dispatched, Google may rotate the refresh token before its body
+        // is parsed. Consumers can stop waiting, but bounded renewal and commit
+        // must retain ownership even if the final consumer cancels.
+        checkAbort(own.controller.signal);
+        own.critical = true;
         const response = await deps.fetch(client.url, {
           method: 'POST', headers, body: form,
           signal: AbortSignal.any([own.controller.signal, AbortSignal.timeout(30_000)]), redirect: 'error',
@@ -413,9 +315,7 @@ export function createNativeSession(options = {}) {
           (data.token_type !== undefined && (typeof data.token_type !== 'string' || data.token_type.toLowerCase() !== 'bearer'))) {
           throw failure('ERR_NATIVE_REFRESH', 'Google returned an invalid native token renewal response.');
         }
-        // A received rotating refresh token must be saved even if the last caller cancels now.
-        own.critical = true;
-        const latest = await read();
+        const latest = await read(undefined, interactive);
         if (providerKey(latest.profile) !== providerKey(current.profile) || tokenSnapshot(latest.profile) !== tokenSnapshot(current.profile)) {
           throw failure('ERR_NATIVE_ACCOUNT_CHANGED', 'Antigravity changed its credentials during renewal; the plugin did not overwrite them.');
         }
@@ -451,7 +351,7 @@ export function createNativeSession(options = {}) {
         }
         if (mappingError) throw mappingError;
         return { ...updated, _principal: principal };
-      }, own.controller.signal).finally(() => {
+      }, own.controller.signal, { interactive }).finally(() => {
         own.settled = true;
         if (flights.get(flightKey) === own) flights.delete(flightKey);
       });
@@ -462,16 +362,17 @@ export function createNativeSession(options = {}) {
   }
 
   return {
-    async profile({ signal, forceRefresh = false, config } = {}) {
+    async profile({ signal, forceRefresh = false, config, interactive = false } = {}) {
       try {
         checkAbort(signal);
-        const initial = await read(signal);
+        interactive = interactive === true;
+        const initial = await read(signal, interactive);
         validateConfig(initial.profile, config);
         const known = await cachedPrincipal(initial.profile);
         if (known) checkBinding({ ...initial.profile, _principal: known }, config);
         let result;
         if (forceRefresh || Date.parse(initial.profile.token.expiry) - deps.now() < REFRESH_MARGIN) {
-          result = await renew(initial, forceRefresh, signal, config);
+          result = await renew(initial, forceRefresh, signal, config, interactive);
         } else {
           try {
             result = { ...initial.profile, _principal: known ?? await identify(initial.profile, signal) };
@@ -479,7 +380,7 @@ export function createNativeSession(options = {}) {
             if (error?.code !== 'ERR_NATIVE_PRINCIPAL') throw error;
             // A successful renewal authenticates an otherwise opaque workforce
             // lineage. Merely possessing an unverified local token does not.
-            result = await renew(initial, true, signal, config);
+            result = await renew(initial, true, signal, config, interactive);
           }
         }
         checkAbort(signal);
